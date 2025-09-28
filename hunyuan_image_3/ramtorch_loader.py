@@ -19,11 +19,13 @@ that keep weights in CPU memory and transfer them to GPU on-demand.
 
 import os
 import sys
+import json
 import torch
 import torch.nn as nn
 from pathlib import Path
 from typing import Optional, Dict, Any, Union
 from transformers import PretrainedConfig
+from transformers.generation.utils import GenerationConfig
 from safetensors import safe_open
 from safetensors.torch import load_file
 
@@ -597,6 +599,18 @@ def load_ramtorch_model(model_class, model_path: Union[str, Path], device: str =
             print(f"Warning: {len(actual_missing)} parameters not loaded: {actual_missing[:5]}{'...' if len(actual_missing) > 5 else ''}")
 
     print(f"Successfully loaded {len(loaded_keys)} parameters")
+
+    # Load generation_config.json if it exists
+    generation_config_path = model_path / "generation_config.json"
+    if generation_config_path.exists():
+        print("Loading generation config...")
+        with open(generation_config_path, 'r') as f:
+            generation_config_dict = json.load(f)
+        model.generation_config = GenerationConfig(**generation_config_dict)
+    else:
+        print("Warning: generation_config.json not found, using default generation config")
+        model.generation_config = GenerationConfig()
+
     print("Model loaded with RamTorch memory management!")
 
     # Add get_memory_stats method to the model
