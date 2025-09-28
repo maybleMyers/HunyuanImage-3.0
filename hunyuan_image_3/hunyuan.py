@@ -1281,6 +1281,9 @@ class HunyuanImage3SDPAAttention(nn.Module):
             query_states = query_states.contiguous()
             key_states = key_states.contiguous()
             value_states = value_states.contiguous()
+            # Ensure attention_mask is on the same device as query_states
+            if attention_mask.device != query_states.device:
+                attention_mask = attention_mask.to(query_states.device)
 
         attn_output = torch.nn.functional.scaled_dot_product_attention(
             query_states, key_states, value_states, attn_mask=attention_mask, dropout_p=0.0
