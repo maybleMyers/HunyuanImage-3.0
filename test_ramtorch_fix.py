@@ -86,15 +86,9 @@ def test_monkey_patch():
         model_ramtorch = LargeTestModel()
 
         # Check that we created RamTorch layers
-        try:
-            from RamTorch.ramtorch import Linear as RamTorchLinear
-            from RamTorch.ramtorch.modules.linear import CPUBouncingLinear
-        except:
-            from ramtorch import Linear as RamTorchLinear
-            from ramtorch.modules.linear import CPUBouncingLinear
-
+        # Count CPUBouncingLinear instances (RamTorch's Linear implementation)
         ramtorch_count = sum(1 for m in model_ramtorch.modules()
-                            if isinstance(m, (RamTorchLinear, CPUBouncingLinear)))
+                            if type(m).__name__ == 'CPUBouncingLinear')
         print(f"RamTorch layers created: {ramtorch_count}")
 
         mem_after_ramtorch = get_memory_usage()
@@ -125,15 +119,6 @@ def test_model_creation():
     print("Testing Model Creation with Monkey-Patch")
     print("=" * 60)
 
-    # Import RamTorch Linear classes
-    try:
-        from RamTorch.ramtorch import Linear as RamTorchLinear
-        from RamTorch.ramtorch.modules.linear import CPUBouncingLinear
-    except:
-        # Fallback if import path is different
-        from ramtorch import Linear as RamTorchLinear
-        from ramtorch.modules.linear import CPUBouncingLinear
-
     # Apply monkey-patch
     original_linear = monkey_patch_linear(device="cuda", verbose=True)
 
@@ -145,14 +130,20 @@ def test_model_creation():
             nn.Linear(200, 100)
         )
 
-        # Verify all Linear layers are RamTorch (check both possible class names)
+        # Verify all Linear layers are RamTorch
+        # The actual class name is CPUBouncingLinear from ramtorch.modules.linear
+        ramtorch_count = 0
         for i, layer in enumerate(model):
             if hasattr(layer, 'in_features'):  # It's a Linear-like layer
-                print(f"  Layer {i}: {type(layer).__name__}")
-                assert isinstance(layer, (RamTorchLinear, CPUBouncingLinear)), \
-                    f"Layer {i} is not RamTorch! Got {type(layer)}"
+                print(f"  Layer {i}: {type(layer).__name__} from {type(layer).__module__}")
+                # Check if it's the CPUBouncingLinear class (RamTorch's implementation)
+                if type(layer).__name__ == 'CPUBouncingLinear':
+                    ramtorch_count += 1
+                else:
+                    print(f"    WARNING: Expected CPUBouncingLinear, got {type(layer)}")
 
-        print("\n✓ All Linear layers successfully created as RamTorch!")
+        assert ramtorch_count == 2, f"Expected 2 RamTorch layers, got {ramtorch_count}"
+        print(f"\n✓ All {ramtorch_count} Linear layers successfully created as RamTorch!")
 
     finally:
         # Restore
