@@ -673,10 +673,6 @@ def load_ramtorch_model(model_class, model_path: Union[str, Path], device: str =
     # Add get_memory_stats method to the model
     model.get_memory_stats = lambda: get_memory_stats(model)
 
-    # Set the model's device attribute for tensor creation
-    # This helps ensure new tensors are created on the correct device
-    model.device = torch.device(device)
-
     # Set model to evaluation mode
     model.eval()
 
