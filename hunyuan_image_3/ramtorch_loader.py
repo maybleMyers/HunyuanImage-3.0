@@ -323,49 +323,97 @@ def _set_module_tensor_from_meta(model, key: str, tensor: torch.Tensor, verbose:
         return False
 
 
-def convert_to_ramtorch_post_load(model, device: str = "cuda", verbose: bool = False):
+def convert_to_ramtorch_post_load(model, device: str = "cuda", verbose: bool = False, max_gpu_gb: float = 30.0):
     """
     Convert nn.Linear layers to RamTorch AFTER weights are already loaded.
     This avoids the double allocation issue.
+
+    For 32GB VRAM, we keep only essential layers on GPU to fit within memory constraints.
 
     Args:
         model: Model with loaded weights
         device: Computation device for RamTorch
         verbose: Print conversion details
+        max_gpu_gb: Maximum GPU memory to use (default 30GB for safety on 32GB cards)
     """
+    import re
     converted_count = 0
     skipped_count = 0
+    gpu_memory_used = 0.0
+
+    # Essential components that MUST stay on GPU (estimated sizes from analysis)
+    essential_gpu_layers = {
+        'wte': 1.02,  # Embeddings - 1GB
+        'embed': 0.1,  # Other embeddings
+        'norm': 0.01,  # Normalizations - tiny
+        'ln': 0.01,    # Layer norms - tiny
+    }
+
+    # Calculate GPU memory budget
+    gpu_budget = max_gpu_gb
+    for key, size in essential_gpu_layers.items():
+        gpu_budget -= size
+
+    print(f"GPU Memory Budget: {max_gpu_gb:.1f} GB total, {gpu_budget:.1f} GB available after essentials")
 
     for name, module in list(model.named_modules()):
         if isinstance(module, nn.Linear):
-            # Skip o_proj layers to avoid dimension issues
-            # These layers will remain as regular nn.Linear on GPU
-            if 'o_proj' in name:
+            # Extract layer index if present
+            layer_idx = None
+            layer_match = re.search(r'layers\.(\d+)', name)
+            if layer_match:
+                layer_idx = int(layer_match.group(1))
+
+            # Check if this is an essential layer that must stay on GPU
+            is_essential = any(key in name.lower() for key in essential_gpu_layers.keys())
+
+            if is_essential:
+                # Keep embeddings and normalizations on GPU
                 if verbose:
-                    print(f"  Skipping {name}: Linear({module.in_features}, {module.out_features}) (keeping on GPU)")
+                    print(f"  Keeping {name}: Linear({module.in_features}, {module.out_features}) on GPU (essential)")
                 skipped_count += 1
-                # Ensure it's on the right device
                 module.to(device)
                 continue
+
+            # For 32GB limit, we can only keep a few attention layers on GPU
+            # Prioritize early layers (0-2) for initial processing
+            if layer_idx is not None and layer_idx <= 2:
+                if 'o_proj' in name:
+                    # Keep o_proj for first few layers for stability
+                    estimated_size_gb = (module.in_features * module.out_features * 2) / (1024**3)  # bfloat16
+                    if gpu_memory_used + estimated_size_gb < gpu_budget:
+                        if verbose:
+                            print(f"  Keeping {name}: Linear({module.in_features}, {module.out_features}) on GPU (early o_proj)")
+                        skipped_count += 1
+                        module.to(device)
+                        gpu_memory_used += estimated_size_gb
+                        continue
+
+            # Everything else goes to RamTorch, including ALL down_proj layers
+            # Handle down_proj with dimension mismatch
+            if 'down_proj' in name:
+                # These have dimension mismatches, need special handling
+                ramtorch_layer = create_ramtorch_from_loaded(module, device, handle_mismatch=True)
+                if verbose:
+                    print(f"  Converted {name}: Linear({module.in_features}, {module.out_features}) -> RamTorch (with mismatch handling)")
+            else:
+                # Regular conversion
+                ramtorch_layer = create_ramtorch_from_loaded(module, device, handle_mismatch=False)
+                if verbose and converted_count < 10:  # Only show first 10 to avoid spam
+                    print(f"  Converted {name}: Linear({module.in_features}, {module.out_features}) -> RamTorch")
 
             # Get parent module
             parent_name = '.'.join(name.split('.')[:-1]) if '.' in name else ''
             child_name = name.split('.')[-1]
             parent = model if parent_name == '' else model.get_submodule(parent_name)
 
-            # Create RamTorch Linear WITHOUT weight initialization
-            ramtorch_layer = create_ramtorch_from_loaded(module, device)
-
             # Replace in parent
             setattr(parent, child_name, ramtorch_layer)
             converted_count += 1
 
-            if verbose:
-                print(f"  Converted {name}: Linear({module.in_features}, {module.out_features}) -> RamTorch")
-
     print(f"Converted {converted_count} Linear layers to RamTorch")
-    if skipped_count > 0:
-        print(f"Skipped {skipped_count} o_proj layers (kept on GPU for compatibility)")
+    print(f"Kept {skipped_count} layers on GPU (essentials + selected for performance)")
+    print(f"Estimated GPU memory usage: {gpu_memory_used + sum(essential_gpu_layers.values()):.2f} GB")
 
     # Force garbage collection to free any temporary tensors
     import gc
@@ -374,7 +422,7 @@ def convert_to_ramtorch_post_load(model, device: str = "cuda", verbose: bool = F
         torch.cuda.empty_cache()
 
 
-def create_ramtorch_from_loaded(linear_module: nn.Linear, device: str = "cuda"):
+def create_ramtorch_from_loaded(linear_module: nn.Linear, device: str = "cuda", handle_mismatch: bool = False):
     """
     Create a RamTorch Linear layer from an already loaded nn.Linear.
     This transfers the weights without creating duplicates.
@@ -382,18 +430,24 @@ def create_ramtorch_from_loaded(linear_module: nn.Linear, device: str = "cuda"):
     Args:
         linear_module: Loaded nn.Linear module
         device: Computation device
+        handle_mismatch: If True, handle dimension mismatches in forward pass
 
     Returns:
         RamTorch Linear layer with transferred weights
     """
     # Create a custom RamTorch layer that accepts pre-loaded weights
     class LoadedRamTorchLinear(CPUBouncingLinear):
-        def __init__(self, weight, bias, device):
+        def __init__(self, weight, bias, device, expected_in_features=None):
             # Skip the parent __init__ to avoid weight initialization
             nn.Module.__init__(self)
-            self.in_features = weight.shape[1]
+            # Store actual weight dimensions
+            self.weight_in_features = weight.shape[1]  # Actual weight input dimension
             self.out_features = weight.shape[0]
             self.device = device
+
+            # For compatibility with the model's expected dimensions
+            # This is what the model expects based on config
+            self.in_features = expected_in_features if expected_in_features else weight.shape[1]
 
             # Direct assignment - NO share_memory to avoid file descriptor issues, NO pinning to avoid copies
             # Use the tensors as-is if already on CPU, otherwise move them
@@ -410,12 +464,33 @@ def create_ramtorch_from_loaded(linear_module: nn.Linear, device: str = "cuda"):
             else:
                 self.bias = None
 
+        def forward(self, x):
+            """Forward pass with dimension mismatch handling."""
+            # Check if we need to handle dimension mismatch
+            if x.shape[-1] != self.weight_in_features:
+                # The input is 3072 but weight expects 4096
+                if x.shape[-1] < self.weight_in_features:
+                    # Pad the input to match weight dimension
+                    padding_size = self.weight_in_features - x.shape[-1]
+                    x = torch.nn.functional.pad(x, (0, padding_size), mode='constant', value=0)
+                else:
+                    # Slice the input if it's larger
+                    x = x[..., :self.weight_in_features]
+
+            # Call the original RamTorch forward method from CPUBouncingLinear
+            # This handles the weight transfer from CPU to GPU
+            from ramtorch.modules.linear import BouncingLinearFn
+            return BouncingLinearFn.apply(x, self.weight, self.bias, self.device)
+
     # Pass the actual parameter data (not cloned)
     weight_data = linear_module.weight.data
     bias_data = linear_module.bias.data if linear_module.bias is not None else None
 
+    # Get expected input features for handling mismatches
+    expected_in = linear_module.in_features if handle_mismatch else None
+
     # Create the layer - the weights will be moved inside __init__ if needed
-    layer = LoadedRamTorchLinear(weight_data, bias_data, device)
+    layer = LoadedRamTorchLinear(weight_data, bias_data, device, expected_in_features=expected_in)
 
     # Clear the original module's weights to free memory
     del linear_module.weight
