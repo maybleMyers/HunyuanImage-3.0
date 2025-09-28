@@ -308,7 +308,7 @@ def print_analysis(analysis: Dict):
     print(f"Total Size: {analysis['total_size_gb']:.2f} GB")
 
     print("\n" + "=" * 80)
-    print("WEIGHTS BY TYPE")
+    print("DETAILED WEIGHTS BY TYPE")
     print("=" * 80)
 
     # Sort by size
@@ -318,29 +318,106 @@ def print_analysis(analysis: Dict):
         reverse=True
     )
 
-    for layer_type, info in sorted_types:
-        print(f"\n{layer_type.upper()}:")
-        print(f"  Count: {info['count']}")
-        print(f"  Total Size: {info['size_gb']:.3f} GB ({info['size_gb']/analysis['total_size_gb']*100:.1f}%)")
+    # Create summary table
+    print("\n{:<25} {:>10} {:>15} {:>10}".format("Type", "Count", "Size (GB)", "Percent"))
+    print("-" * 60)
 
-        # Show top 5 largest weights of this type
-        if info['weights']:
-            sorted_weights = sorted(info['weights'], key=lambda x: x['size_mb'], reverse=True)[:5]
-            print(f"  Largest weights:")
-            for w in sorted_weights:
-                shape_str = f"{w['shape']}" if w['shape'] else "unknown"
-                print(f"    - {w['name']}: {w['size_mb']:.1f} MB {shape_str}")
+    for layer_type, info in sorted_types:
+        print("{:<25} {:>10} {:>15.2f} {:>9.1f}%".format(
+            layer_type.upper()[:25],
+            info['count'],
+            info['size_gb'],
+            info['size_gb']/analysis['total_size_gb']*100 if analysis['total_size_gb'] > 0 else 0
+        ))
+
+    print("-" * 60)
+    print("{:<25} {:>10} {:>15.2f} {:>9.1f}%".format(
+        "TOTAL",
+        analysis['total_weights'],
+        analysis['total_size_gb'],
+        100.0
+    ))
+
+    # Detailed breakdown for major types
+    print("\n" + "=" * 80)
+    print("COMPONENT BREAKDOWN")
+    print("=" * 80)
+
+    # Group by component type for better analysis
+    component_stats = {
+        'MoE Experts': {'count': 0, 'size_gb': 0, 'patterns': ['experts']},
+        'Attention Q/K/V': {'count': 0, 'size_gb': 0, 'patterns': ['q_proj', 'k_proj', 'v_proj']},
+        'Attention O': {'count': 0, 'size_gb': 0, 'patterns': ['o_proj']},
+        'MLP Gate/Up': {'count': 0, 'size_gb': 0, 'patterns': ['gate_and_up_proj', 'gate_proj', 'up_proj']},
+        'MLP Down': {'count': 0, 'size_gb': 0, 'patterns': ['down_proj']},
+        'Embeddings': {'count': 0, 'size_gb': 0, 'patterns': ['wte', 'embed']},
+        'Normalizations': {'count': 0, 'size_gb': 0, 'patterns': ['norm', 'ln']},
+        'MoE Gates': {'count': 0, 'size_gb': 0, 'patterns': ['gate.wg']},
+    }
+
+    # Calculate component stats
+    for layer_type, info in analysis['by_type'].items():
+        for weight in info['weights']:
+            weight_name = weight['name'].lower()
+            weight_mb = weight.get('size_mb', 0)
+
+            for comp_name, comp_info in component_stats.items():
+                if any(pattern in weight_name for pattern in comp_info['patterns']):
+                    comp_info['count'] += 1
+                    comp_info['size_gb'] += weight_mb / 1024
+                    break
+
+    print("\n{:<20} {:>10} {:>15} {:>10}".format("Component", "Count", "Size (GB)", "Percent"))
+    print("-" * 60)
+
+    for comp_name, comp_info in sorted(component_stats.items(), key=lambda x: x[1]['size_gb'], reverse=True):
+        if comp_info['count'] > 0:
+            print("{:<20} {:>10} {:>15.2f} {:>9.1f}%".format(
+                comp_name,
+                comp_info['count'],
+                comp_info['size_gb'],
+                comp_info['size_gb']/analysis['total_size_gb']*100 if analysis['total_size_gb'] > 0 else 0
+            ))
+
+    print("\n" + "=" * 80)
+    print("LAYER DISTRIBUTION (Top 10 Layers by Size)")
+    print("=" * 80)
+
+    # Get layer statistics
+    layer_sorted = sorted(
+        [(k, v) for k, v in analysis['by_layer'].items()],
+        key=lambda x: x[1]['size_gb'],
+        reverse=True
+    )[:10]
+
+    print("\n{:<15} {:>10} {:>15}".format("Layer", "Weights", "Size (GB)"))
+    print("-" * 40)
+    for layer_name, layer_info in layer_sorted:
+        print("{:<15} {:>10} {:>15.2f}".format(
+            layer_name,
+            layer_info['count'],
+            layer_info['size_gb']
+        ))
 
     print("\n" + "=" * 80)
     print("SHAPE MISMATCHES DETECTED")
     print("=" * 80)
 
     if analysis['shape_mismatches']:
-        for mismatch in analysis['shape_mismatches']:
-            print(f"\n{mismatch['name']}:")
-            print(f"  Expected input dim: {mismatch['expected_input']}")
-            print(f"  Actual input dim: {mismatch['actual_input']}")
-            print(f"  Recommendation: {mismatch['recommendation']}")
+        print(f"\nFound {len(analysis['shape_mismatches'])} weights with shape mismatches:")
+        print("\n{:<60} {:>10} {:>10}".format("Weight Name", "Expected", "Actual"))
+        print("-" * 80)
+        for mismatch in analysis['shape_mismatches'][:10]:  # Show first 10
+            name_short = mismatch['name']
+            if len(name_short) > 60:
+                name_short = "..." + name_short[-57:]
+            print("{:<60} {:>10} {:>10}".format(
+                name_short,
+                mismatch['expected_input'],
+                mismatch['actual_input']
+            ))
+        if len(analysis['shape_mismatches']) > 10:
+            print(f"... and {len(analysis['shape_mismatches']) - 10} more")
     else:
         print("\nNo shape mismatches detected")
 
@@ -354,38 +431,86 @@ def print_analysis(analysis: Dict):
 
     gpu_size = 0
     ramtorch_size = 0
+    gpu_breakdown = defaultdict(float)
+    ramtorch_breakdown = defaultdict(float)
 
     for layer_type, info in analysis['by_type'].items():
         for weight in info['weights']:
             if weight['name'] in gpu_weights:
                 gpu_size += weight['size_mb'] / 1024  # Convert to GB
+                # Categorize GPU weights
+                if 'embed' in weight['name'].lower() or 'wte' in weight['name'].lower():
+                    gpu_breakdown['Embeddings'] += weight['size_mb'] / 1024
+                elif 'norm' in weight['name'].lower():
+                    gpu_breakdown['Normalizations'] += weight['size_mb'] / 1024
+                elif 'o_proj' in weight['name']:
+                    gpu_breakdown['O_proj layers'] += weight['size_mb'] / 1024
+                elif 'down_proj' in weight['name']:
+                    gpu_breakdown['Down_proj (mismatched)'] += weight['size_mb'] / 1024
+                else:
+                    gpu_breakdown['Other'] += weight['size_mb'] / 1024
             elif weight['name'] in ramtorch_weights:
                 ramtorch_size += weight['size_mb'] / 1024
+                # Categorize RamTorch weights
+                if 'experts' in weight['name']:
+                    ramtorch_breakdown['MoE Experts'] += weight['size_mb'] / 1024
+                elif any(proj in weight['name'] for proj in ['q_proj', 'k_proj', 'v_proj']):
+                    ramtorch_breakdown['Attention QKV'] += weight['size_mb'] / 1024
+                elif 'gate_and_up_proj' in weight['name'] or 'up_proj' in weight['name']:
+                    ramtorch_breakdown['Gate/Up proj'] += weight['size_mb'] / 1024
+                else:
+                    ramtorch_breakdown['Other'] += weight['size_mb'] / 1024
 
-    print(f"\nKEEP ON GPU ({len(gpu_weights)} weights, ~{gpu_size:.2f} GB):")
-    print("  - All embeddings and normalization layers")
-    print("  - Vision and VAE components")
-    print("  - Output projection layers (o_proj)")
-    print("  - Layers with shape mismatches (down_proj with incompatible dims)")
+    print(f"\n{'='*40}")
+    print(f"KEEP ON GPU: {len(gpu_weights)} weights, {gpu_size:.2f} GB")
+    print(f"{'='*40}")
+    for category, size in sorted(gpu_breakdown.items(), key=lambda x: x[1], reverse=True):
+        print(f"  {category:<25} {size:>8.2f} GB ({size/gpu_size*100:>5.1f}%)")
 
-    print(f"\nCONVERT TO RAMTORCH ({len(ramtorch_weights)} weights, ~{ramtorch_size:.2f} GB):")
-    print("  - MoE expert layers")
-    print("  - Most attention projections (q_proj, k_proj, v_proj)")
-    print("  - Compatible MLP layers")
-    print("  - Gate and up projections")
+    print(f"\n{'='*40}")
+    print(f"CONVERT TO RAMTORCH: {len(ramtorch_weights)} weights, {ramtorch_size:.2f} GB")
+    print(f"{'='*40}")
+    for category, size in sorted(ramtorch_breakdown.items(), key=lambda x: x[1], reverse=True):
+        print(f"  {category:<25} {size:>8.2f} GB ({size/ramtorch_size*100:>5.1f}%)")
 
-    print(f"\nMEMORY SAVINGS:")
-    print(f"  GPU Memory Required: ~{gpu_size:.2f} GB")
-    print(f"  CPU Memory (RamTorch): ~{ramtorch_size:.2f} GB")
-    print(f"  GPU Memory Saved: ~{ramtorch_size:.2f} GB ({ramtorch_size/analysis['total_size_gb']*100:.1f}%)")
+    print(f"\n{'='*40}")
+    print("MEMORY SUMMARY")
+    print(f"{'='*40}")
+    print(f"  Total Model Size:        {analysis['total_size_gb']:>8.2f} GB")
+    print(f"  GPU Memory Required:     {gpu_size:>8.2f} GB ({gpu_size/analysis['total_size_gb']*100:.1f}%)")
+    print(f"  CPU Memory (RamTorch):   {ramtorch_size:>8.2f} GB ({ramtorch_size/analysis['total_size_gb']*100:.1f}%)")
+    print(f"  GPU Memory Saved:        {ramtorch_size:>8.2f} GB ({ramtorch_size/analysis['total_size_gb']*100:.1f}%)")
+
+    # Provide guidance based on common GPU sizes
+    print(f"\n{'='*40}")
+    print("GPU COMPATIBILITY")
+    print(f"{'='*40}")
+    gpu_configs = [
+        (24, "RTX 3090/4090"),
+        (40, "A100-40GB"),
+        (48, "RTX A6000/L40"),
+        (80, "A100-80GB/H100"),
+    ]
+
+    for gpu_mem, gpu_name in gpu_configs:
+        if gpu_size <= gpu_mem:
+            print(f"  ✓ {gpu_name:<20} Can fit GPU weights ({gpu_size:.1f}/{gpu_mem} GB)")
+        else:
+            print(f"  ✗ {gpu_name:<20} Insufficient ({gpu_size:.1f}/{gpu_mem} GB)")
 
     print("\n" + "=" * 80)
     print("TOP 10 LARGEST WEIGHTS")
     print("=" * 80)
 
+    print("\n{:>3} {:<50} {:>10} {:<15}".format("#", "Weight Name", "Size (MB)", "Type"))
+    print("-" * 80)
+
     sorted_large = sorted(analysis['large_weights'], key=lambda x: x['size_mb'], reverse=True)[:10]
     for i, weight in enumerate(sorted_large, 1):
-        print(f"{i:2d}. {weight['name']}: {weight['size_mb']:.1f} MB ({weight['type']})")
+        name_short = weight['name']
+        if len(name_short) > 50:
+            name_short = "..." + name_short[-47:]
+        print(f"{i:>3} {name_short:<50} {weight['size_mb']:>10.1f} {weight['type']:<15}")
 
 def main():
     """Main analysis function."""
