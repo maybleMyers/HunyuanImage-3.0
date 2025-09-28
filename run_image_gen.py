@@ -15,6 +15,7 @@ import argparse
 import os
 from pathlib import Path
 from hunyuan_image_3.hunyuan import HunyuanImage3ForCausalMM
+from hunyuan_image_3.ramtorch_loader import load_ramtorch_model
 from PE.deepseek import DeepSeekClient
 from PE.system_prompt import system_prompt_universal, system_prompt_text_rendering
 
@@ -48,10 +49,12 @@ def parse_args():
     parser.add_argument("--save", type=str, default="image.png", help="Path to save the generated image")
     parser.add_argument("--verbose", type=int, default=0, help="Verbose level")
     parser.add_argument("--rewrite", default=True, help="Whether to rewrite the prompt with DeepSeek")
-    parser.add_argument("--sys-deepseek-prompt", type=str, choices=["universal", "text_rendering"], 
+    parser.add_argument("--sys-deepseek-prompt", type=str, choices=["universal", "text_rendering"],
                         default="universal", help="System prompt for rewriting the prompt")
 
     parser.add_argument("--reproduce", action="store_true", help="Whether to reproduce the results")
+    parser.add_argument("--use-ramtorch", action="store_true", help="Use RamTorch memory management to reduce GPU memory usage")
+    parser.add_argument("--ramtorch-verbose", action="store_true", help="Print detailed RamTorch replacement information")
     return parser.parse_args()
 
 
@@ -87,14 +90,40 @@ def main(args):
     if not Path(args.model_id).exists():
         raise ValueError(f"Model path {args.model_id} does not exist")
 
-    kwargs = dict(
-        attn_implementation=args.attn_impl,
-        torch_dtype="auto",
-        device_map="auto",
-        moe_impl=args.moe_impl,
-    )
-    model = HunyuanImage3ForCausalMM.from_pretrained(args.model_id, **kwargs)
-    model.load_tokenizer(args.model_id)
+    if args.use_ramtorch:
+        print("Loading model with RamTorch memory management...")
+        # Load model with RamTorch Linear layers
+        model = load_ramtorch_model(
+            HunyuanImage3ForCausalMM,
+            args.model_id,
+            device="cuda",
+            verbose=args.ramtorch_verbose,
+            attn_implementation=args.attn_impl,
+            moe_impl=args.moe_impl,
+        )
+        model.load_tokenizer(args.model_id)
+
+        # Print memory statistics
+        if args.ramtorch_verbose:
+            if hasattr(model, 'get_memory_stats'):
+                stats = model.get_memory_stats()
+                print(f"\nMemory Statistics:")
+                print(f"  Total parameters: {stats['total_params']:,}")
+                print(f"  GPU parameters: {stats['gpu_params']:,}")
+                print(f"  CPU parameters: {stats['cpu_params']:,}")
+                print(f"  Total memory: {stats['total_memory_mb']:.2f} MB")
+                print(f"  GPU memory: {stats['gpu_memory_mb']:.2f} MB")
+                print(f"  CPU memory: {stats['cpu_memory_mb']:.2f} MB")
+                print(f"  GPU memory saved: {stats['gpu_memory_saved_pct']:.1f}%\n")
+    else:
+        kwargs = dict(
+            attn_implementation=args.attn_impl,
+            torch_dtype="auto",
+            device_map="auto",
+            moe_impl=args.moe_impl,
+        )
+        model = HunyuanImage3ForCausalMM.from_pretrained(args.model_id, **kwargs)
+        model.load_tokenizer(args.model_id)
 
     if args.rewrite:
         # 通过环境变量获取DeepSeek的key_id和key_secret
