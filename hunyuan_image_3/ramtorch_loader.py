@@ -446,13 +446,19 @@ def create_ramtorch_from_loaded(linear_module: nn.Linear, device: str = "cuda", 
             self.is_down_proj_mismatch = is_down_proj_mismatch
 
             # For down_proj layers with SwiGLU mismatch, slice the weight
-            # The weight is [4096, 6144] but we only need [4096, 3072]
-            if is_down_proj_mismatch and weight.shape[1] == 6144:
-                # Only use the first 3072 columns of the weight matrix
-                weight = weight[:, :3072].contiguous()
-                if bias is not None:
-                    # Bias shape should match output dimension, so it's fine
-                    pass
+            # The weight is [out_features, 6144] but we only need [out_features, 3072]
+            if is_down_proj_mismatch:
+                print(f"    DEBUG in __init__: is_down_proj_mismatch={is_down_proj_mismatch}, weight.shape={weight.shape}")
+                if weight.shape[1] == 6144:
+                    # Only use the first 3072 columns of the weight matrix
+                    print(f"    SLICING weight from {weight.shape} to [{weight.shape[0]}, 3072]")
+                    weight = weight[:, :3072].contiguous()
+                    print(f"    After slicing: weight.shape={weight.shape}")
+                elif weight.shape[1] == 4096:
+                    # For shared_mlp down_proj, slice differently
+                    print(f"    SLICING weight from {weight.shape} to [{weight.shape[0]}, 3072]")
+                    weight = weight[:, :3072].contiguous()
+                    print(f"    After slicing: weight.shape={weight.shape}")
 
             # Store actual weight dimensions after potential slicing
             self.in_features = weight.shape[1]
@@ -486,12 +492,23 @@ def create_ramtorch_from_loaded(linear_module: nn.Linear, device: str = "cuda", 
 
     # Check if this is a down_proj layer with the SwiGLU dimension mismatch
     is_down_proj_mismatch = False
-    if 'down_proj' in layer_name and handle_mismatch:
-        # Check if weight has the problematic shape [out_features, 6144]
-        if weight_data.shape[1] == 6144 or weight_data.shape[1] == 4096:
-            is_down_proj_mismatch = True
+    if 'down_proj' in layer_name:
+        # Always print for debugging
+        print(f"DEBUG: Processing down_proj layer {layer_name}")
+        print(f"  Weight shape: {weight_data.shape}")
+        print(f"  Handle mismatch: {handle_mismatch}")
+
+        if handle_mismatch:
+            # Check if weight has the problematic shape [out_features, 6144] or [out_features, 4096]
             if weight_data.shape[1] == 6144:
-                print(f"  Fixing down_proj dimension mismatch in {layer_name}: slicing weight from [{weight_data.shape[0]}, 6144] to [{weight_data.shape[0]}, 3072]")
+                is_down_proj_mismatch = True
+                print(f"  WILL FIX: Slicing weight from [{weight_data.shape[0]}, 6144] to [{weight_data.shape[0]}, 3072]")
+            elif weight_data.shape[1] == 4096:
+                # This might be the shared_mlp down_proj which has different dimensions
+                is_down_proj_mismatch = True
+                print(f"  WILL FIX: Weight has shape [{weight_data.shape[0]}, 4096] - will handle in forward")
+            else:
+                print(f"  No mismatch detected for shape {weight_data.shape}")
 
     # Create the layer - the weights will be moved inside __init__ if needed
     layer = LoadedRamTorchLinear(weight_data, bias_data, device, layer_name=layer_name, is_down_proj_mismatch=is_down_proj_mismatch)
