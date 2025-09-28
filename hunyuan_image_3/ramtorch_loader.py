@@ -334,9 +334,20 @@ def convert_to_ramtorch_post_load(model, device: str = "cuda", verbose: bool = F
         verbose: Print conversion details
     """
     converted_count = 0
+    skipped_count = 0
 
     for name, module in list(model.named_modules()):
         if isinstance(module, nn.Linear):
+            # Skip o_proj layers to avoid dimension issues
+            # These layers will remain as regular nn.Linear on GPU
+            if 'o_proj' in name:
+                if verbose:
+                    print(f"  Skipping {name}: Linear({module.in_features}, {module.out_features}) (keeping on GPU)")
+                skipped_count += 1
+                # Ensure it's on the right device
+                module.to(device)
+                continue
+
             # Get parent module
             parent_name = '.'.join(name.split('.')[:-1]) if '.' in name else ''
             child_name = name.split('.')[-1]
@@ -353,6 +364,8 @@ def convert_to_ramtorch_post_load(model, device: str = "cuda", verbose: bool = F
                 print(f"  Converted {name}: Linear({module.in_features}, {module.out_features}) -> RamTorch")
 
     print(f"Converted {converted_count} Linear layers to RamTorch")
+    if skipped_count > 0:
+        print(f"Skipped {skipped_count} o_proj layers (kept on GPU for compatibility)")
 
     # Force garbage collection to free any temporary tensors
     import gc
