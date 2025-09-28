@@ -34,6 +34,8 @@ if ramtorch_path.exists():
 
 try:
     from ramtorch import Linear as RamTorchLinear
+    # The actual class might be CPUBouncingLinear
+    from ramtorch.modules.linear import CPUBouncingLinear
 except ImportError:
     raise ImportError(
         "RamTorch not found. Please ensure RamTorch is in the RamTorch directory "
@@ -202,10 +204,10 @@ def create_model_with_ramtorch(model_class, config: PretrainedConfig, device: st
         # Create model - all nn.Linear calls will create RamTorch Linear
         model = model_class(config)
 
-        # Count RamTorch layers created
+        # Count RamTorch layers created (check both possible class names)
         ramtorch_count = 0
         for name, module in model.named_modules():
-            if isinstance(module, RamTorchLinear):
+            if isinstance(module, (RamTorchLinear, CPUBouncingLinear)):
                 ramtorch_count += 1
 
         print(f"Created model with {ramtorch_count} RamTorch Linear layers")
@@ -281,7 +283,7 @@ def load_ramtorch_model(model_class, model_path: Union[str, Path], device: str =
                             if part:
                                 module = getattr(module, part)
 
-                        if isinstance(module, RamTorchLinear):
+                        if isinstance(module, (RamTorchLinear, CPUBouncingLinear)):
                             # Keep on CPU for RamTorch layers
                             param.data = loaded_tensor.clone().to(dtype=param.dtype)
                             if param.data.dtype in [torch.float16, torch.float32, torch.bfloat16]:
