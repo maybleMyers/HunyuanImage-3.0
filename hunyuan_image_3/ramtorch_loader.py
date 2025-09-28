@@ -358,6 +358,10 @@ def convert_to_ramtorch_post_load(model, device: str = "cuda", verbose: bool = F
 
     for name, module in list(model.named_modules()):
         if isinstance(module, nn.Linear):
+            # Debug: Show ALL Linear layers to find shared_mlp
+            if 'shared_mlp' in name and 'down_proj' in name:
+                print(f"FOUND SHARED_MLP.DOWN_PROJ: {name}, shape: {module.weight.shape}")
+
             # Extract layer index if present
             layer_idx = None
             layer_match = re.search(r'layers\.(\d+)', name)
@@ -391,10 +395,11 @@ def convert_to_ramtorch_post_load(model, device: str = "cuda", verbose: bool = F
 
             # Everything else goes to RamTorch, including ALL down_proj layers
             # Handle down_proj with dimension mismatch
-            if 'down_proj' in name:
+            # Also handle shared_mlp layers which may have dimension issues
+            if 'down_proj' in name or 'shared_mlp' in name:
                 # These have dimension mismatches, need special handling
                 ramtorch_layer = create_ramtorch_from_loaded(module, device, handle_mismatch=True, layer_name=name)
-                if verbose:
+                if verbose or 'shared_mlp' in name:  # Always show shared_mlp for debugging
                     print(f"  Converted {name}: Linear({module.in_features}, {module.out_features}) -> RamTorch (with mismatch handling)")
             else:
                 # Regular conversion
@@ -491,10 +496,11 @@ def create_ramtorch_from_loaded(linear_module: nn.Linear, device: str = "cuda", 
     bias_data = linear_module.bias.data if linear_module.bias is not None else None
 
     # Check if this is a down_proj layer with the SwiGLU dimension mismatch
+    # Also check for shared_mlp layers which may have similar issues
     is_down_proj_mismatch = False
-    if 'down_proj' in layer_name:
+    if 'down_proj' in layer_name or 'shared_mlp' in layer_name:
         # Always print for debugging
-        print(f"DEBUG: Processing down_proj layer {layer_name}")
+        print(f"DEBUG: Processing layer {layer_name}")
         print(f"  Weight shape: {weight_data.shape}")
         print(f"  Handle mismatch: {handle_mismatch}")
 
@@ -506,7 +512,7 @@ def create_ramtorch_from_loaded(linear_module: nn.Linear, device: str = "cuda", 
             elif weight_data.shape[1] == 4096:
                 # This might be the shared_mlp down_proj which has different dimensions
                 is_down_proj_mismatch = True
-                print(f"  WILL FIX: Weight has shape [{weight_data.shape[0]}, 4096] - will handle in forward")
+                print(f"  WILL FIX: Weight has shape [{weight_data.shape[0]}, 4096] - slicing to 3072")
             else:
                 print(f"  No mismatch detected for shape {weight_data.shape}")
 
