@@ -377,16 +377,31 @@ def print_analysis(analysis: Dict):
 
 def main():
     """Main analysis function."""
+    import sys
+
+    # Get model directory from command line or use default
+    if len(sys.argv) > 1:
+        model_dir = Path(sys.argv[1])
+    else:
+        model_dir = Path("model")
+
     # Paths
-    config_path = Path("model/config.json")
-    index_path = Path("model/model.safetensors.index.json")
+    config_path = model_dir / "config.json"
+    index_path = model_dir / "model.safetensors.index.json"
 
     if not config_path.exists():
         print(f"Error: Config file not found at {config_path}")
+        print(f"Looking in directory: {model_dir.absolute()}")
+        # Try to list what files are there
+        if model_dir.exists():
+            print(f"Files found in {model_dir}:")
+            for f in sorted(model_dir.glob("*.json"))[:10]:
+                print(f"  - {f.name}")
         return
 
     if not index_path.exists():
         print(f"Error: Index file not found at {index_path}")
+        print(f"Looking in directory: {model_dir.absolute()}")
         return
 
     print("Analyzing model weights...")
