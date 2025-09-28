@@ -223,8 +223,10 @@ def infer_weight_shape(weight_name: str, config: Dict) -> List[int]:
 
     # Get MoE-specific dimensions
     moe_intermediate_sizes = config.get('moe_intermediate_size', [intermediate_size] * 32)
-    if layer_idx < len(moe_intermediate_sizes):
+    if isinstance(moe_intermediate_sizes, list) and layer_idx < len(moe_intermediate_sizes):
         moe_intermediate_size = moe_intermediate_sizes[layer_idx]
+    elif isinstance(moe_intermediate_sizes, int):
+        moe_intermediate_size = moe_intermediate_sizes
     else:
         moe_intermediate_size = intermediate_size
 
@@ -249,7 +251,10 @@ def infer_weight_shape(weight_name: str, config: Dict) -> List[int]:
         else:
             # Shared MLP
             num_shared = config.get('num_shared_expert', [1] * 32)
-            shared_experts = num_shared[layer_idx] if layer_idx < len(num_shared) else 1
+            if isinstance(num_shared, list):
+                shared_experts = num_shared[layer_idx] if layer_idx < len(num_shared) else 1
+            else:
+                shared_experts = num_shared if num_shared else 1
             actual_intermediate = moe_intermediate_size * shared_experts
             if config.get('hidden_act') == 'silu':
                 return [hidden_size, actual_intermediate * 2]
@@ -265,7 +270,10 @@ def infer_weight_shape(weight_name: str, config: Dict) -> List[int]:
         else:
             # Shared MLP down projection
             num_shared = config.get('num_shared_expert', [1] * 32)
-            shared_experts = num_shared[layer_idx] if layer_idx < len(num_shared) else 1
+            if isinstance(num_shared, list):
+                shared_experts = num_shared[layer_idx] if layer_idx < len(num_shared) else 1
+            else:
+                shared_experts = num_shared if num_shared else 1
             actual_intermediate = moe_intermediate_size * shared_experts
             if config.get('hidden_act') == 'silu':
                 return [actual_intermediate, hidden_size]  # Note: for shared, it's not divided
@@ -279,8 +287,12 @@ def infer_weight_shape(weight_name: str, config: Dict) -> List[int]:
 
     # MoE gates
     if 'gate.wg' in weight_name:
-        num_experts = config.get('num_experts', [48] * 32)
-        experts = num_experts[layer_idx] if layer_idx < len(num_experts) else 48
+        num_experts = config.get('num_experts', 48)
+        # Handle both int and list types
+        if isinstance(num_experts, list):
+            experts = num_experts[layer_idx] if layer_idx < len(num_experts) else 48
+        else:
+            experts = num_experts
         return [hidden_size, experts]
 
     # Default: can't infer
