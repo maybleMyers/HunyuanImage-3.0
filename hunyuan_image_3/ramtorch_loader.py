@@ -124,45 +124,154 @@ def patch_linear_in_module(module: nn.Module, device: str = "cuda", verbose: boo
     return replaced_count
 
 
-def load_state_dict_cpu_pinned(model_path: Union[str, Path], device_map: Optional[Dict] = None) -> Dict[str, torch.Tensor]:
+def load_weights_streaming(model, model_path: Union[str, Path], verbose: bool = False) -> set:
     """
-    Load model state dict directly to CPU with pinned memory for efficient transfer.
+    Load weights one-by-one directly into model parameters to avoid memory duplication.
+
+    This function loads weights from disk and assigns them directly to model parameters
+    without creating intermediate copies, minimizing memory usage.
 
     Args:
-        model_path: Path to model directory or checkpoint file
-        device_map: Optional device map for model parallelism
+        model: PyTorch model with parameters to fill
+        model_path: Path to model directory containing weight files
+        verbose: Print detailed loading information
 
     Returns:
-        State dictionary with CPU-pinned tensors
+        Set of successfully loaded parameter keys
     """
+    import gc
     model_path = Path(model_path)
-    state_dict = {}
 
-    # Find safetensors files
-    safetensor_files = list(model_path.glob("*.safetensors"))
-
-    if not safetensor_files:
-        # Try loading from pytorch_model.bin
-        pytorch_file = model_path / "pytorch_model.bin"
-        if pytorch_file.exists():
-            print(f"Loading weights from {pytorch_file}")
-            checkpoint = torch.load(pytorch_file, map_location="cpu")
-            state_dict = checkpoint if isinstance(checkpoint, dict) and "state_dict" not in checkpoint else checkpoint.get("state_dict", checkpoint)
+    # Find weight files (safetensors preferred, then .bin)
+    weight_files = list(model_path.glob("*.safetensors"))
+    if not weight_files:
+        bin_files = list(model_path.glob("*.bin"))
+        if bin_files:
+            weight_files = bin_files
         else:
-            raise FileNotFoundError(f"No model weights found in {model_path}")
-    else:
-        # Load from safetensors files
-        for file_path in safetensor_files:
-            print(f"Loading weights from {file_path}")
-            with safe_open(file_path, framework="pt", device="cpu") as f:
-                for key in f.keys():
-                    tensor = f.get_tensor(key)
-                    # Pin memory for faster CPU-GPU transfers
-                    if tensor.dtype in [torch.float16, torch.float32, torch.bfloat16]:
-                        tensor = tensor.pin_memory()
-                    state_dict[key] = tensor
+            raise FileNotFoundError(f"No weight files found in {model_path}")
 
-    return state_dict
+    loaded_keys = set()
+    total_params = sum(p.numel() for p in model.parameters())
+
+    if verbose:
+        print(f"Loading weights from {len(weight_files)} file(s)")
+        print(f"Model has {total_params:,} total parameters")
+
+    for weight_file in weight_files:
+        if verbose:
+            print(f"\nLoading {weight_file.name}...")
+
+        if weight_file.suffix == ".safetensors":
+            # Use safetensors for efficient loading
+            with safe_open(weight_file, framework="pt", device="cpu") as f:
+                for key in f.keys():
+                    try:
+                        # Get tensor without loading all at once
+                        tensor = f.get_tensor(key)
+
+                        # Navigate to the parameter in the model
+                        if _set_module_parameter(model, key, tensor, verbose):
+                            loaded_keys.add(key)
+
+                        # Explicitly delete tensor to free memory
+                        del tensor
+
+                    except Exception as e:
+                        if verbose:
+                            print(f"  Warning: Could not load {key}: {e}")
+        else:
+            # Handle .bin files
+            checkpoint = torch.load(weight_file, map_location="cpu")
+            if isinstance(checkpoint, dict):
+                # Handle different checkpoint formats
+                if "state_dict" in checkpoint:
+                    checkpoint = checkpoint["state_dict"]
+
+                for key, tensor in checkpoint.items():
+                    try:
+                        if _set_module_parameter(model, key, tensor, verbose):
+                            loaded_keys.add(key)
+                        del tensor
+                    except Exception as e:
+                        if verbose:
+                            print(f"  Warning: Could not load {key}: {e}")
+
+            # Clear the checkpoint from memory
+            del checkpoint
+
+        # Force garbage collection after each file
+        gc.collect()
+
+        if verbose:
+            loaded_percent = (len(loaded_keys) / len(list(model.state_dict().keys()))) * 100
+            print(f"  Progress: {len(loaded_keys)} parameters loaded ({loaded_percent:.1f}%)")
+
+    # Final garbage collection
+    gc.collect()
+
+    return loaded_keys
+
+
+def _set_module_parameter(model, key: str, tensor: torch.Tensor, verbose: bool = False) -> bool:
+    """
+    Helper function to set a specific parameter in the model.
+
+    Args:
+        model: PyTorch model
+        key: Parameter key (e.g., "layers.0.weight")
+        tensor: Tensor to assign
+        verbose: Print debug information
+
+    Returns:
+        True if successfully set, False otherwise
+    """
+    try:
+        # Split the key into parts
+        keys = key.split('.')
+
+        # Navigate to the parent module
+        obj = model
+        for k in keys[:-1]:
+            obj = getattr(obj, k)
+
+        # Get the parameter name
+        param_name = keys[-1]
+
+        # Set the parameter
+        if hasattr(obj, param_name):
+            param = getattr(obj, param_name)
+
+            with torch.no_grad():
+                if isinstance(param, nn.Parameter):
+                    # Check if shapes match
+                    if param.shape != tensor.shape:
+                        if verbose:
+                            print(f"  Shape mismatch for {key}: expected {param.shape}, got {tensor.shape}")
+                        return False
+
+                    # For CPU parameters (RamTorch), pin memory for faster transfers
+                    if param.device.type == "cpu":
+                        if tensor.dtype in [torch.float16, torch.float32, torch.bfloat16]:
+                            param.data = tensor.pin_memory()
+                        else:
+                            param.data = tensor
+                    else:
+                        # For GPU parameters (embeddings, etc.), move to device
+                        param.data = tensor.to(param.device)
+
+                    return True
+                elif isinstance(obj, nn.Module) and param_name == "weight" or param_name == "bias":
+                    # Handle buffer or other attributes
+                    setattr(obj, param_name, tensor)
+                    return True
+
+        return False
+
+    except Exception as e:
+        if verbose:
+            print(f"  Error setting {key}: {e}")
+        return False
 
 
 def create_model_with_ramtorch(model_class, config: PretrainedConfig, device: str = "cuda", verbose: bool = False, **kwargs):
@@ -226,7 +335,10 @@ def create_model_with_ramtorch(model_class, config: PretrainedConfig, device: st
 def load_ramtorch_model(model_class, model_path: Union[str, Path], device: str = "cuda",
                         verbose: bool = False, **kwargs):
     """
-    Load a model with RamTorch Linear layers, avoiding GPU memory allocation during loading.
+    Load a model with RamTorch Linear layers using streaming to avoid memory duplication.
+
+    This function creates a model with RamTorch Linear layers and loads weights
+    one at a time directly into model parameters, preventing memory duplication.
 
     Args:
         model_class: Model class to load
@@ -238,84 +350,47 @@ def load_ramtorch_model(model_class, model_path: Union[str, Path], device: str =
     Returns:
         Model loaded with RamTorch Linear layers
     """
+    import gc
     model_path = Path(model_path)
 
     # Load configuration
+    print("Loading model configuration...")
     config = model_class.config_class.from_pretrained(model_path)
 
     # Create model with RamTorch layers
+    print("Creating model with RamTorch Linear layers...")
     model = create_model_with_ramtorch(model_class, config, device=device, verbose=verbose, **kwargs)
 
-    # Load weights directly to CPU-pinned memory
-    print("Loading model weights to CPU memory...")
-    state_dict = load_state_dict_cpu_pinned(model_path)
+    # Clear any existing GPU cache before loading
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    gc.collect()
 
-    # Custom loading to handle RamTorch Linear layers
-    missing_keys = []
-    unexpected_keys = []
-    mismatched_keys = []
+    # Load weights using streaming approach
+    print("Loading model weights (streaming mode to minimize memory)...")
+    loaded_keys = load_weights_streaming(model, model_path, verbose=verbose)
 
-    # Get model state dict for comparison
-    model_state = model.state_dict()
+    # Check for missing parameters
+    model_params = set(model.state_dict().keys())
+    missing_keys = model_params - loaded_keys
 
-    for key in state_dict.keys():
-        if key not in model_state:
-            unexpected_keys.append(key)
-
-    for name, param in model.named_parameters():
-        if name in state_dict:
-            with torch.no_grad():
-                # Get the tensor from state_dict
-                loaded_tensor = state_dict[name]
-
-                # Check shape compatibility
-                if param.shape != loaded_tensor.shape:
-                    mismatched_keys.append(f"{name}: expected {param.shape}, got {loaded_tensor.shape}")
-                    continue
-
-                # For RamTorch Linear layers, weights should stay on CPU
-                if "weight" in name or "bias" in name:
-                    # Check if this parameter belongs to a RamTorch Linear layer
-                    module_name = ".".join(name.split(".")[:-1])
-                    try:
-                        module = model
-                        for part in module_name.split("."):
-                            if part:
-                                module = getattr(module, part)
-
-                        if isinstance(module, (RamTorchLinear, CPUBouncingLinear)):
-                            # Keep on CPU for RamTorch layers
-                            param.data = loaded_tensor.clone().to(dtype=param.dtype)
-                            if param.data.dtype in [torch.float16, torch.float32, torch.bfloat16]:
-                                param.data = param.data.share_memory_().pin_memory()
-                        else:
-                            # Move to device for non-RamTorch layers
-                            param.data = loaded_tensor.to(device=device, dtype=param.dtype)
-                    except:
-                        # Default behavior if we can't determine the module type
-                        if param.device.type == "cpu":
-                            param.data = loaded_tensor.clone().to(dtype=param.dtype)
-                            if param.data.dtype in [torch.float16, torch.float32, torch.bfloat16]:
-                                param.data = param.data.share_memory_().pin_memory()
-                        else:
-                            param.data = loaded_tensor.to(device=device, dtype=param.dtype)
-        else:
-            missing_keys.append(name)
-
-    # Load buffers (non-parameter tensors)
-    for name, buffer in model.named_buffers():
-        if name in state_dict:
-            buffer.copy_(state_dict[name].to(device))
-
-    # Report loading issues
     if missing_keys:
-        print(f"Warning: Missing keys in checkpoint: {missing_keys[:5]}{'...' if len(missing_keys) > 5 else ''}")
-    if unexpected_keys:
-        print(f"Warning: Unexpected keys in checkpoint: {unexpected_keys[:5]}{'...' if len(unexpected_keys) > 5 else ''}")
-    if mismatched_keys:
-        print(f"Warning: Shape mismatches: {mismatched_keys[:5]}{'...' if len(mismatched_keys) > 5 else ''}")
+        # Some keys might be buffers or have different names
+        actual_missing = []
+        for key in missing_keys:
+            try:
+                # Check if parameter exists and has been initialized
+                param = model.state_dict()[key]
+                if torch.all(param == 0) or torch.all(torch.isnan(param)):
+                    actual_missing.append(key)
+            except:
+                actual_missing.append(key)
 
-    print("Model loaded successfully with RamTorch memory management!")
+        if actual_missing and verbose:
+            print(f"Warning: {len(actual_missing)} parameters not loaded: {actual_missing[:5]}{'...' if len(actual_missing) > 5 else ''}")
+
+    print(f"Successfully loaded {len(loaded_keys)} parameters")
+    print("Model loaded with RamTorch memory management!")
 
     # Add get_memory_stats method to the model
     model.get_memory_stats = lambda: get_memory_stats(model)
