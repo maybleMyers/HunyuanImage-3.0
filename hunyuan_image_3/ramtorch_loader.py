@@ -41,6 +41,45 @@ except ImportError:
     )
 
 
+def monkey_patch_linear(device="cuda", verbose=False):
+    """
+    Temporarily replace nn.Linear with RamTorch Linear during model construction.
+
+    This ensures Linear layers are created as RamTorch Linear from the start,
+    avoiding duplicate memory usage during model loading.
+
+    Args:
+        device: Target device for computation
+        verbose: Print creation information
+
+    Returns:
+        Original nn.Linear class (for restoration)
+    """
+    original_linear = nn.Linear
+
+    class RamTorchLinearWrapper(nn.Module):
+        """Wrapper that creates RamTorch Linear with nn.Linear interface"""
+        def __new__(cls, in_features, out_features, bias=True, device=None, dtype=None):
+            # Create RamTorch Linear instead of regular Linear
+            if verbose:
+                print(f"  Creating RamTorch Linear({in_features}, {out_features}, bias={bias})")
+
+            # RamTorch expects device as computation target (cuda)
+            # Weights will be on CPU, computation on specified device
+            return RamTorchLinear(
+                in_features=in_features,
+                out_features=out_features,
+                bias=bias,
+                dtype=dtype if dtype is not None else torch.float32,
+                device=device if device is not None else "cuda"
+            )
+
+    # Replace nn.Linear globally
+    nn.Linear = RamTorchLinearWrapper
+
+    return original_linear
+
+
 def patch_linear_in_module(module: nn.Module, device: str = "cuda", verbose: bool = False) -> int:
     """
     Recursively replace all nn.Linear layers in a module with RamTorch Linear layers.
@@ -126,7 +165,10 @@ def load_state_dict_cpu_pinned(model_path: Union[str, Path], device_map: Optiona
 
 def create_model_with_ramtorch(model_class, config: PretrainedConfig, device: str = "cuda", verbose: bool = False, **kwargs):
     """
-    Create a model instance with all Linear layers replaced by RamTorch Linear layers.
+    Create a model instance with all Linear layers created as RamTorch Linear from the start.
+
+    This uses monkey-patching to replace nn.Linear during model construction,
+    avoiding duplicate memory usage.
 
     Args:
         model_class: Model class to instantiate
@@ -146,12 +188,35 @@ def create_model_with_ramtorch(model_class, config: PretrainedConfig, device: st
     if 'moe_impl' in kwargs:
         config.moe_impl = kwargs['moe_impl']
 
-    # Create model normally first (we'll replace Linear layers before loading weights)
-    model = model_class(config)
+    # Monkey-patch nn.Linear BEFORE model creation
+    original_linear = monkey_patch_linear(device=device, verbose=verbose)
 
-    # Replace all Linear layers with RamTorch Linear
-    replaced_count = patch_linear_in_module(model, device=device, verbose=verbose)
-    print(f"Replaced {replaced_count} Linear layers with RamTorch Linear layers")
+    # Also patch the linear function in hunyuan module if it exists
+    hunyuan_module = sys.modules.get('hunyuan_image_3.hunyuan')
+    original_hunyuan_linear = None
+    if hunyuan_module and hasattr(hunyuan_module, 'linear'):
+        original_hunyuan_linear = hunyuan_module.linear
+        hunyuan_module.linear = lambda *args, **kwargs: nn.Linear(*args, **kwargs)
+
+    try:
+        # Create model - all nn.Linear calls will create RamTorch Linear
+        model = model_class(config)
+
+        # Count RamTorch layers created
+        ramtorch_count = 0
+        for name, module in model.named_modules():
+            if isinstance(module, RamTorchLinear):
+                ramtorch_count += 1
+
+        print(f"Created model with {ramtorch_count} RamTorch Linear layers")
+
+    finally:
+        # Restore original nn.Linear
+        nn.Linear = original_linear
+
+        # Restore hunyuan linear function if it was patched
+        if original_hunyuan_linear is not None:
+            hunyuan_module.linear = original_hunyuan_linear
 
     return model
 
