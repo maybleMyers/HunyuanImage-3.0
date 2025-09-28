@@ -611,6 +611,63 @@ def load_ramtorch_model(model_class, model_path: Union[str, Path], device: str =
         print("Warning: generation_config.json not found, using default generation config")
         model.generation_config = GenerationConfig()
 
+    # Move non-RamTorch components to GPU
+    print("Moving non-RamTorch components to GPU...")
+
+    # Specifically move known components that need to be on GPU
+    # These are typically embeddings, layer norms, and other non-Linear layers
+    components_to_move = []
+
+    # Find and move embeddings
+    if hasattr(model, 'model') and hasattr(model.model, 'wte'):
+        model.model.wte = model.model.wte.to(device)
+        components_to_move.append('model.wte (embeddings)')
+
+    # Move vision model if it exists
+    if hasattr(model, 'vision_model'):
+        model.vision_model = model.vision_model.to(device)
+        components_to_move.append('vision_model')
+
+    # Move vision aligner if it exists
+    if hasattr(model, 'vision_aligner'):
+        model.vision_aligner = model.vision_aligner.to(device)
+        components_to_move.append('vision_aligner')
+
+    # Move VAE if it exists
+    if hasattr(model, 'vae'):
+        model.vae = model.vae.to(device)
+        components_to_move.append('vae')
+
+    # Move timestep embedders if they exist
+    if hasattr(model, 'timestep_emb'):
+        model.timestep_emb = model.timestep_emb.to(device)
+        components_to_move.append('timestep_emb')
+    if hasattr(model, 'time_embed'):
+        model.time_embed = model.time_embed.to(device)
+        components_to_move.append('time_embed')
+    if hasattr(model, 'time_embed_2'):
+        model.time_embed_2 = model.time_embed_2.to(device)
+        components_to_move.append('time_embed_2')
+
+    # Move patch_embed and final_layer if they exist
+    if hasattr(model, 'patch_embed'):
+        model.patch_embed = model.patch_embed.to(device)
+        components_to_move.append('patch_embed')
+    if hasattr(model, 'final_layer'):
+        model.final_layer = model.final_layer.to(device)
+        components_to_move.append('final_layer')
+
+    # Move all LayerNorm and RMSNorm layers to GPU
+    for name, module in model.named_modules():
+        if 'norm' in module.__class__.__name__.lower() or 'Norm' in module.__class__.__name__:
+            module.to(device)
+            if verbose and name not in components_to_move:
+                components_to_move.append(f'{name} ({module.__class__.__name__})')
+
+    if verbose and components_to_move:
+        print(f"  Moved to {device}: {', '.join(components_to_move[:5])}" +
+              (f" and {len(components_to_move)-5} more" if len(components_to_move) > 5 else ""))
+
     print("Model loaded with RamTorch memory management!")
 
     # Add get_memory_stats method to the model
