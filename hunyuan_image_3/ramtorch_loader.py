@@ -395,11 +395,10 @@ def convert_to_ramtorch_post_load(model, device: str = "cuda", verbose: bool = F
 
             # Everything else goes to RamTorch, including ALL down_proj layers
             # Handle down_proj with dimension mismatch
-            # Also handle shared_mlp layers which may have dimension issues
-            if 'down_proj' in name or 'shared_mlp' in name:
+            if 'down_proj' in name:
                 # These have dimension mismatches, need special handling
                 ramtorch_layer = create_ramtorch_from_loaded(module, device, handle_mismatch=True, layer_name=name)
-                if verbose or 'shared_mlp' in name:  # Always show shared_mlp for debugging
+                if verbose:
                     print(f"  Converted {name}: Linear({module.in_features}, {module.out_features}) -> RamTorch (with mismatch handling)")
             else:
                 # Regular conversion
@@ -498,9 +497,9 @@ def create_ramtorch_from_loaded(linear_module: nn.Linear, device: str = "cuda", 
     # Check if this is a down_proj layer with the SwiGLU dimension mismatch
     # Also check for shared_mlp layers which may have similar issues
     is_down_proj_mismatch = False
-    if 'down_proj' in layer_name or 'shared_mlp' in layer_name:
+    if 'down_proj' in layer_name:
         # Always print for debugging
-        print(f"DEBUG: Processing layer {layer_name}")
+        print(f"DEBUG: Processing down_proj layer {layer_name}")
         print(f"  Weight shape: {weight_data.shape}")
         print(f"  Handle mismatch: {handle_mismatch}")
 
