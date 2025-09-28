@@ -352,6 +352,12 @@ def convert_to_ramtorch_post_load(model, device: str = "cuda", verbose: bool = F
 
     print(f"Converted {converted_count} Linear layers to RamTorch")
 
+    # Force garbage collection to free any temporary tensors
+    import gc
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
 
 def create_ramtorch_from_loaded(linear_module: nn.Linear, device: str = "cuda"):
     """
@@ -374,20 +380,34 @@ def create_ramtorch_from_loaded(linear_module: nn.Linear, device: str = "cuda"):
             self.out_features = weight.shape[0]
             self.device = device
 
-            # Directly assign the loaded weights (already on CPU)
-            # Use share_memory for multi-process support, NO pinning to avoid copies
-            self.weight = nn.Parameter(weight.share_memory_() if weight.is_cpu else weight.cpu().share_memory_())
+            # Direct assignment - NO share_memory to avoid file descriptor issues, NO pinning to avoid copies
+            # Use the tensors as-is if already on CPU, otherwise move them
+            if weight.is_cpu:
+                self.weight = nn.Parameter(weight)
+            else:
+                self.weight = nn.Parameter(weight.cpu())
+
             if bias is not None:
-                self.bias = nn.Parameter(bias.share_memory_() if bias.is_cpu else bias.cpu().share_memory_())
+                if bias.is_cpu:
+                    self.bias = nn.Parameter(bias)
+                else:
+                    self.bias = nn.Parameter(bias.cpu())
             else:
                 self.bias = None
 
-    # Create the layer with loaded weights
-    return LoadedRamTorchLinear(
-        linear_module.weight.data,
-        linear_module.bias.data if linear_module.bias is not None else None,
-        device
-    )
+    # Pass the actual parameter data (not cloned)
+    weight_data = linear_module.weight.data
+    bias_data = linear_module.bias.data if linear_module.bias is not None else None
+
+    # Create the layer - the weights will be moved inside __init__ if needed
+    layer = LoadedRamTorchLinear(weight_data, bias_data, device)
+
+    # Clear the original module's weights to free memory
+    del linear_module.weight
+    if linear_module.bias is not None:
+        del linear_module.bias
+
+    return layer
 
 
 def _set_module_parameter(model, key: str, tensor: torch.Tensor, verbose: bool = False) -> bool:
