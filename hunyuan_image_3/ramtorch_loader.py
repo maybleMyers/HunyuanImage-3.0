@@ -305,8 +305,11 @@ def _set_module_tensor_from_meta(model, key: str, tensor: torch.Tensor, verbose:
 
             if isinstance(param, nn.Parameter):
                 # Replace meta parameter with actual tensor
-                # Keep on CPU for now (will be moved to RamTorch later)
-                new_param = nn.Parameter(tensor.to(dtype=param.dtype))
+                # Avoid copy - convert dtype only if needed
+                if tensor.dtype != param.dtype:
+                    tensor = tensor.to(dtype=param.dtype)
+                # Direct assignment, no pinning
+                new_param = nn.Parameter(tensor)
                 setattr(obj, param_name, new_param)
                 return True
 
@@ -372,10 +375,10 @@ def create_ramtorch_from_loaded(linear_module: nn.Linear, device: str = "cuda"):
             self.device = device
 
             # Directly assign the loaded weights (already on CPU)
-            # Pin memory for faster transfers
-            self.weight = nn.Parameter(weight.pin_memory() if weight.is_cpu else weight.cpu().pin_memory())
+            # Use share_memory for multi-process support, NO pinning to avoid copies
+            self.weight = nn.Parameter(weight.share_memory_() if weight.is_cpu else weight.cpu().share_memory_())
             if bias is not None:
-                self.bias = nn.Parameter(bias.pin_memory() if bias.is_cpu else bias.cpu().pin_memory())
+                self.bias = nn.Parameter(bias.share_memory_() if bias.is_cpu else bias.cpu().share_memory_())
             else:
                 self.bias = None
 
@@ -424,12 +427,9 @@ def _set_module_parameter(model, key: str, tensor: torch.Tensor, verbose: bool =
                             print(f"  Shape mismatch for {key}: expected {param.shape}, got {tensor.shape}")
                         return False
 
-                    # For CPU parameters (RamTorch), pin memory for faster transfers
+                    # For CPU parameters (RamTorch), no pinning to avoid copies
                     if param.device.type == "cpu":
-                        if tensor.dtype in [torch.float16, torch.float32, torch.bfloat16]:
-                            param.data = tensor.pin_memory()
-                        else:
-                            param.data = tensor
+                        param.data = tensor  # Direct assignment, no pinning
                     else:
                         # For GPU parameters (embeddings, etc.), move to device
                         param.data = tensor.to(param.device)
