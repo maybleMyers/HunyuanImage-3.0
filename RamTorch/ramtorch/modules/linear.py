@@ -84,26 +84,44 @@ class BouncingLinearFn(torch.autograd.Function):
         # get index from clock
         selected_buffer = state["forward_clk"]
 
-        # enqueue transfer on transfer stream
-        with torch.cuda.stream(transfer_stream):
-            # if it's a first time, it's a no-op
-            # wait for compute event to finish first
-            transfer_stream.wait_event(compute_forward_start_event)
-
-            # alternate between buffers to prevent race condition where the transfer stream
-            # overwriting the weight buffers before the main stream finish calculating the value
-            w_buffers[selected_buffer] = weight_cpu.to(device, non_blocking=True)
+        # Check if this is the first time (buffer is None)
+        if w_buffers[selected_buffer] is None:
+            # First time: do a synchronous transfer
+            w_buffers[selected_buffer] = weight_cpu.to(device, non_blocking=False)
             b_buffers[selected_buffer] = (
-                bias_cpu.to(device, non_blocking=True) if bias_cpu is not None else None
+                bias_cpu.to(device, non_blocking=False) if bias_cpu is not None else None
             )
-
-            # flip the clock!
+            # Prepare the other buffer asynchronously for next time
+            next_buffer = selected_buffer ^ 1
+            with torch.cuda.stream(transfer_stream):
+                w_buffers[next_buffer] = weight_cpu.to(device, non_blocking=True)
+                b_buffers[next_buffer] = (
+                    bias_cpu.to(device, non_blocking=True) if bias_cpu is not None else None
+                )
+                transfer_forward_finished_event.record()
+            # flip the clock for next time
             state["forward_clk"] ^= 1
-            # record event after transfer is done
-            transfer_forward_finished_event.record()
+        else:
+            # Not first time: use existing buffer and prepare next one
+            # enqueue transfer on transfer stream
+            with torch.cuda.stream(transfer_stream):
+                # wait for compute event to finish first
+                transfer_stream.wait_event(compute_forward_start_event)
 
-        # make compute stream wait for this transfer
-        torch.cuda.current_stream().wait_event(transfer_forward_finished_event)
+                # Prepare the next buffer (not the one we're about to use)
+                next_buffer = selected_buffer ^ 1
+                w_buffers[next_buffer] = weight_cpu.to(device, non_blocking=True)
+                b_buffers[next_buffer] = (
+                    bias_cpu.to(device, non_blocking=True) if bias_cpu is not None else None
+                )
+
+                # flip the clock for next time
+                state["forward_clk"] ^= 1
+                # record event after transfer is done
+                transfer_forward_finished_event.record()
+
+            # make compute stream wait for this transfer
+            torch.cuda.current_stream().wait_event(transfer_forward_finished_event)
 
         # mark the start of compute event
         compute_forward_start_event.record()
