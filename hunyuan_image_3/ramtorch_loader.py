@@ -393,12 +393,12 @@ def convert_to_ramtorch_post_load(model, device: str = "cuda", verbose: bool = F
             # Handle down_proj with dimension mismatch
             if 'down_proj' in name:
                 # These have dimension mismatches, need special handling
-                ramtorch_layer = create_ramtorch_from_loaded(module, device, handle_mismatch=True)
+                ramtorch_layer = create_ramtorch_from_loaded(module, device, handle_mismatch=True, layer_name=name)
                 if verbose:
                     print(f"  Converted {name}: Linear({module.in_features}, {module.out_features}) -> RamTorch (with mismatch handling)")
             else:
                 # Regular conversion
-                ramtorch_layer = create_ramtorch_from_loaded(module, device, handle_mismatch=False)
+                ramtorch_layer = create_ramtorch_from_loaded(module, device, handle_mismatch=False, layer_name=name)
                 if verbose and converted_count < 10:  # Only show first 10 to avoid spam
                     print(f"  Converted {name}: Linear({module.in_features}, {module.out_features}) -> RamTorch")
 
@@ -422,7 +422,7 @@ def convert_to_ramtorch_post_load(model, device: str = "cuda", verbose: bool = F
         torch.cuda.empty_cache()
 
 
-def create_ramtorch_from_loaded(linear_module: nn.Linear, device: str = "cuda", handle_mismatch: bool = False):
+def create_ramtorch_from_loaded(linear_module: nn.Linear, device: str = "cuda", handle_mismatch: bool = False, layer_name: str = ""):
     """
     Create a RamTorch Linear layer from an already loaded nn.Linear.
     This transfers the weights without creating duplicates.
@@ -431,23 +431,32 @@ def create_ramtorch_from_loaded(linear_module: nn.Linear, device: str = "cuda", 
         linear_module: Loaded nn.Linear module
         device: Computation device
         handle_mismatch: If True, handle dimension mismatches in forward pass
+        layer_name: Name of the layer for debugging and special handling
 
     Returns:
         RamTorch Linear layer with transferred weights
     """
     # Create a custom RamTorch layer that accepts pre-loaded weights
     class LoadedRamTorchLinear(CPUBouncingLinear):
-        def __init__(self, weight, bias, device, expected_in_features=None):
+        def __init__(self, weight, bias, device, layer_name="", is_down_proj_mismatch=False):
             # Skip the parent __init__ to avoid weight initialization
             nn.Module.__init__(self)
-            # Store actual weight dimensions
-            self.weight_in_features = weight.shape[1]  # Actual weight input dimension
-            self.out_features = weight.shape[0]
+            self.layer_name = layer_name
             self.device = device
+            self.is_down_proj_mismatch = is_down_proj_mismatch
 
-            # For compatibility with the model's expected dimensions
-            # This is what the model expects based on config
-            self.in_features = expected_in_features if expected_in_features else weight.shape[1]
+            # For down_proj layers with SwiGLU mismatch, slice the weight
+            # The weight is [4096, 6144] but we only need [4096, 3072]
+            if is_down_proj_mismatch and weight.shape[1] == 6144:
+                # Only use the first 3072 columns of the weight matrix
+                weight = weight[:, :3072].contiguous()
+                if bias is not None:
+                    # Bias shape should match output dimension, so it's fine
+                    pass
+
+            # Store actual weight dimensions after potential slicing
+            self.in_features = weight.shape[1]
+            self.out_features = weight.shape[0]
 
             # Direct assignment - NO share_memory to avoid file descriptor issues, NO pinning to avoid copies
             # Use the tensors as-is if already on CPU, otherwise move them
@@ -465,18 +474,7 @@ def create_ramtorch_from_loaded(linear_module: nn.Linear, device: str = "cuda", 
                 self.bias = None
 
         def forward(self, x):
-            """Forward pass with dimension mismatch handling."""
-            # Check if we need to handle dimension mismatch
-            if x.shape[-1] != self.weight_in_features:
-                # The input is 3072 but weight expects 4096
-                if x.shape[-1] < self.weight_in_features:
-                    # Pad the input to match weight dimension
-                    padding_size = self.weight_in_features - x.shape[-1]
-                    x = torch.nn.functional.pad(x, (0, padding_size), mode='constant', value=0)
-                else:
-                    # Slice the input if it's larger
-                    x = x[..., :self.weight_in_features]
-
+            """Forward pass - weight dimensions should now match after slicing."""
             # Call the original RamTorch forward method from CPUBouncingLinear
             # This handles the weight transfer from CPU to GPU
             from ramtorch.modules.linear import BouncingLinearFn
@@ -486,11 +484,17 @@ def create_ramtorch_from_loaded(linear_module: nn.Linear, device: str = "cuda", 
     weight_data = linear_module.weight.data
     bias_data = linear_module.bias.data if linear_module.bias is not None else None
 
-    # Get expected input features for handling mismatches
-    expected_in = linear_module.in_features if handle_mismatch else None
+    # Check if this is a down_proj layer with the SwiGLU dimension mismatch
+    is_down_proj_mismatch = False
+    if 'down_proj' in layer_name and handle_mismatch:
+        # Check if weight has the problematic shape [out_features, 6144]
+        if weight_data.shape[1] == 6144 or weight_data.shape[1] == 4096:
+            is_down_proj_mismatch = True
+            if weight_data.shape[1] == 6144:
+                print(f"  Fixing down_proj dimension mismatch in {layer_name}: slicing weight from [{weight_data.shape[0]}, 6144] to [{weight_data.shape[0]}, 3072]")
 
     # Create the layer - the weights will be moved inside __init__ if needed
-    layer = LoadedRamTorchLinear(weight_data, bias_data, device, expected_in_features=expected_in)
+    layer = LoadedRamTorchLinear(weight_data, bias_data, device, layer_name=layer_name, is_down_proj_mismatch=is_down_proj_mismatch)
 
     # Clear the original module's weights to free memory
     del linear_module.weight
