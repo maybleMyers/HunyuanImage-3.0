@@ -358,9 +358,6 @@ def convert_to_ramtorch_post_load(model, device: str = "cuda", verbose: bool = F
 
     for name, module in list(model.named_modules()):
         if isinstance(module, nn.Linear):
-            # Debug: Show ALL Linear layers to find shared_mlp
-            if 'shared_mlp' in name and 'down_proj' in name:
-                print(f"FOUND SHARED_MLP.DOWN_PROJ: {name}, shape: {module.weight.shape}")
 
             # Extract layer index if present
             layer_idx = None
@@ -452,21 +449,24 @@ def create_ramtorch_from_loaded(linear_module: nn.Linear, device: str = "cuda", 
             # For down_proj layers with SwiGLU mismatch, slice the weight
             # The weight is [out_features, 6144] but we only need [out_features, 3072]
             if is_down_proj_mismatch:
-                print(f"    DEBUG in __init__: is_down_proj_mismatch={is_down_proj_mismatch}, weight.shape={weight.shape}")
-                if weight.shape[1] == 6144:
+                if weight.shape[1] == 6144 or weight.shape[1] == 4096:
                     # Only use the first 3072 columns of the weight matrix
-                    print(f"    SLICING weight from {weight.shape} to [{weight.shape[0]}, 3072]")
                     weight = weight[:, :3072].contiguous()
-                    print(f"    After slicing: weight.shape={weight.shape}")
-                elif weight.shape[1] == 4096:
-                    # For shared_mlp down_proj, slice differently
-                    print(f"    SLICING weight from {weight.shape} to [{weight.shape[0]}, 3072]")
-                    weight = weight[:, :3072].contiguous()
-                    print(f"    After slicing: weight.shape={weight.shape}")
 
             # Store actual weight dimensions after potential slicing
             self.in_features = weight.shape[1]
             self.out_features = weight.shape[0]
+
+            # Verify shape expectations for shared_mlp layers
+            if 'shared_mlp' in layer_name:
+                if 'down_proj' in layer_name:
+                    if weight.shape != torch.Size([4096, 3072]):
+                        print(f"ERROR: shared_mlp.down_proj has unexpected shape {weight.shape}, expected [4096, 3072]")
+                        raise ValueError(f"shared_mlp.down_proj shape mismatch: {weight.shape}")
+                elif 'gate_and_up_proj' in layer_name:
+                    if weight.shape != torch.Size([4096, 6144]):
+                        print(f"ERROR: shared_mlp.gate_and_up_proj has unexpected shape {weight.shape}, expected [4096, 6144]")
+                        raise ValueError(f"shared_mlp.gate_and_up_proj shape mismatch: {weight.shape}")
 
             # Direct assignment - NO share_memory to avoid file descriptor issues, NO pinning to avoid copies
             # Use the tensors as-is if already on CPU, otherwise move them
@@ -485,35 +485,31 @@ def create_ramtorch_from_loaded(linear_module: nn.Linear, device: str = "cuda", 
 
         def forward(self, x):
             """Forward pass - weight dimensions should now match after slicing."""
+            # Only log errors for shared_mlp layers to avoid console overflow
+            if 'shared_mlp' in self.layer_name and 'down_proj' in self.layer_name:
+                if self.weight.shape[1] != 3072:
+                    print(f"CRITICAL ERROR in {self.layer_name}: Weight has shape {self.weight.shape}, expected [4096, 3072]")
+
             # Call the original RamTorch forward method from CPUBouncingLinear
             # This handles the weight transfer from CPU to GPU
             from ramtorch.modules.linear import BouncingLinearFn
             return BouncingLinearFn.apply(x, self.weight, self.bias, self.device)
 
-    # Pass the actual parameter data (not cloned)
-    weight_data = linear_module.weight.data
-    bias_data = linear_module.bias.data if linear_module.bias is not None else None
+    # Clone the weight data to prevent accidental sharing between layers
+    # This is critical for shared_mlp where gate_and_up_proj and down_proj might share references
+    weight_data = linear_module.weight.data.clone()
+    bias_data = linear_module.bias.data.clone() if linear_module.bias is not None else None
 
     # Check if this is a down_proj layer with the SwiGLU dimension mismatch
-    # Also check for shared_mlp layers which may have similar issues
     is_down_proj_mismatch = False
-    if 'down_proj' in layer_name:
-        # Always print for debugging
-        print(f"DEBUG: Processing down_proj layer {layer_name}")
-        print(f"  Weight shape: {weight_data.shape}")
-        print(f"  Handle mismatch: {handle_mismatch}")
-
-        if handle_mismatch:
-            # Check if weight has the problematic shape [out_features, 6144] or [out_features, 4096]
-            if weight_data.shape[1] == 6144:
-                is_down_proj_mismatch = True
-                print(f"  WILL FIX: Slicing weight from [{weight_data.shape[0]}, 6144] to [{weight_data.shape[0]}, 3072]")
-            elif weight_data.shape[1] == 4096:
-                # This might be the shared_mlp down_proj which has different dimensions
-                is_down_proj_mismatch = True
-                print(f"  WILL FIX: Weight has shape [{weight_data.shape[0]}, 4096] - slicing to 3072")
-            else:
-                print(f"  No mismatch detected for shape {weight_data.shape}")
+    if 'down_proj' in layer_name and handle_mismatch:
+        # Only log if there's an actual mismatch to fix
+        if weight_data.shape[1] == 6144:
+            is_down_proj_mismatch = True
+            print(f"  Fixing {layer_name}: Slicing weight from [{weight_data.shape[0]}, 6144] to [{weight_data.shape[0]}, 3072]")
+        elif weight_data.shape[1] == 4096:
+            is_down_proj_mismatch = True
+            print(f"  Fixing {layer_name}: Slicing weight from [{weight_data.shape[0]}, 4096] to [{weight_data.shape[0]}, 3072]")
 
     # Create the layer - the weights will be moved inside __init__ if needed
     layer = LoadedRamTorchLinear(weight_data, bias_data, device, layer_name=layer_name, is_down_proj_mismatch=is_down_proj_mismatch)
