@@ -213,6 +213,180 @@ def load_weights_streaming(model, model_path: Union[str, Path], verbose: bool = 
     return loaded_keys
 
 
+def load_weights_from_disk_to_meta(model, model_path: Union[str, Path], verbose: bool = False) -> set:
+    """
+    Load weights from disk directly into a meta model, converting from meta to CPU/GPU.
+
+    Args:
+        model: Model with meta device parameters
+        model_path: Path to model weights
+        verbose: Print detailed information
+
+    Returns:
+        Set of loaded parameter keys
+    """
+    import gc
+    model_path = Path(model_path)
+
+    # Find weight files
+    weight_files = list(model_path.glob("*.safetensors"))
+    if not weight_files:
+        weight_files = list(model_path.glob("*.bin"))
+        if not weight_files:
+            raise FileNotFoundError(f"No weight files found in {model_path}")
+
+    loaded_keys = set()
+
+    for weight_file in weight_files:
+        if verbose:
+            print(f"Loading {weight_file.name}...")
+
+        if weight_file.suffix == ".safetensors":
+            with safe_open(weight_file, framework="pt", device="cpu") as f:
+                for key in f.keys():
+                    try:
+                        # Get tensor from file
+                        tensor = f.get_tensor(key)
+
+                        # Set in model (converting from meta to actual device)
+                        if _set_module_tensor_from_meta(model, key, tensor, verbose):
+                            loaded_keys.add(key)
+
+                        del tensor
+                    except Exception as e:
+                        if verbose:
+                            print(f"  Warning: Could not load {key}: {e}")
+        else:
+            # Handle .bin files
+            checkpoint = torch.load(weight_file, map_location="cpu")
+            if isinstance(checkpoint, dict):
+                if "state_dict" in checkpoint:
+                    checkpoint = checkpoint["state_dict"]
+
+                for key, tensor in checkpoint.items():
+                    try:
+                        if _set_module_tensor_from_meta(model, key, tensor, verbose):
+                            loaded_keys.add(key)
+                        del tensor
+                    except Exception as e:
+                        if verbose:
+                            print(f"  Warning: Could not load {key}: {e}")
+
+            del checkpoint
+
+        gc.collect()
+
+    return loaded_keys
+
+
+def _set_module_tensor_from_meta(model, key: str, tensor: torch.Tensor, verbose: bool = False) -> bool:
+    """
+    Set a tensor in a model that has meta device parameters.
+
+    Args:
+        model: Model with meta parameters
+        key: Parameter key
+        tensor: Tensor to set
+        verbose: Print debug info
+
+    Returns:
+        True if successful
+    """
+    try:
+        keys = key.split('.')
+        obj = model
+        for k in keys[:-1]:
+            obj = getattr(obj, k)
+
+        param_name = keys[-1]
+
+        if hasattr(obj, param_name):
+            param = getattr(obj, param_name)
+
+            if isinstance(param, nn.Parameter):
+                # Replace meta parameter with actual tensor
+                # Keep on CPU for now (will be moved to RamTorch later)
+                new_param = nn.Parameter(tensor.to(dtype=param.dtype))
+                setattr(obj, param_name, new_param)
+                return True
+
+        return False
+
+    except Exception as e:
+        if verbose:
+            print(f"  Error setting {key}: {e}")
+        return False
+
+
+def convert_to_ramtorch_post_load(model, device: str = "cuda", verbose: bool = False):
+    """
+    Convert nn.Linear layers to RamTorch AFTER weights are already loaded.
+    This avoids the double allocation issue.
+
+    Args:
+        model: Model with loaded weights
+        device: Computation device for RamTorch
+        verbose: Print conversion details
+    """
+    converted_count = 0
+
+    for name, module in list(model.named_modules()):
+        if isinstance(module, nn.Linear):
+            # Get parent module
+            parent_name = '.'.join(name.split('.')[:-1]) if '.' in name else ''
+            child_name = name.split('.')[-1]
+            parent = model if parent_name == '' else model.get_submodule(parent_name)
+
+            # Create RamTorch Linear WITHOUT weight initialization
+            ramtorch_layer = create_ramtorch_from_loaded(module, device)
+
+            # Replace in parent
+            setattr(parent, child_name, ramtorch_layer)
+            converted_count += 1
+
+            if verbose:
+                print(f"  Converted {name}: Linear({module.in_features}, {module.out_features}) -> RamTorch")
+
+    print(f"Converted {converted_count} Linear layers to RamTorch")
+
+
+def create_ramtorch_from_loaded(linear_module: nn.Linear, device: str = "cuda"):
+    """
+    Create a RamTorch Linear layer from an already loaded nn.Linear.
+    This transfers the weights without creating duplicates.
+
+    Args:
+        linear_module: Loaded nn.Linear module
+        device: Computation device
+
+    Returns:
+        RamTorch Linear layer with transferred weights
+    """
+    # Create a custom RamTorch layer that accepts pre-loaded weights
+    class LoadedRamTorchLinear(CPUBouncingLinear):
+        def __init__(self, weight, bias, device):
+            # Skip the parent __init__ to avoid weight initialization
+            nn.Module.__init__(self)
+            self.in_features = weight.shape[1]
+            self.out_features = weight.shape[0]
+            self.device = device
+
+            # Directly assign the loaded weights (already on CPU)
+            # Pin memory for faster transfers
+            self.weight = nn.Parameter(weight.pin_memory() if weight.is_cpu else weight.cpu().pin_memory())
+            if bias is not None:
+                self.bias = nn.Parameter(bias.pin_memory() if bias.is_cpu else bias.cpu().pin_memory())
+            else:
+                self.bias = None
+
+    # Create the layer with loaded weights
+    return LoadedRamTorchLinear(
+        linear_module.weight.data,
+        linear_module.bias.data if linear_module.bias is not None else None,
+        device
+    )
+
+
 def _set_module_parameter(model, key: str, tensor: torch.Tensor, verbose: bool = False) -> bool:
     """
     Helper function to set a specific parameter in the model.
@@ -335,10 +509,12 @@ def create_model_with_ramtorch(model_class, config: PretrainedConfig, device: st
 def load_ramtorch_model(model_class, model_path: Union[str, Path], device: str = "cuda",
                         verbose: bool = False, **kwargs):
     """
-    Load a model with RamTorch Linear layers using streaming to avoid memory duplication.
+    Load a model with RamTorch Linear layers without memory duplication.
 
-    This function creates a model with RamTorch Linear layers and loads weights
-    one at a time directly into model parameters, preventing memory duplication.
+    This function:
+    1. Creates model on meta device (no memory allocation)
+    2. Loads weights directly from disk
+    3. Converts nn.Linear to RamTorch after weights are loaded
 
     Args:
         model_class: Model class to load
@@ -357,18 +533,29 @@ def load_ramtorch_model(model_class, model_path: Union[str, Path], device: str =
     print("Loading model configuration...")
     config = model_class.config_class.from_pretrained(model_path)
 
-    # Create model with RamTorch layers
-    print("Creating model with RamTorch Linear layers...")
-    model = create_model_with_ramtorch(model_class, config, device=device, verbose=verbose, **kwargs)
+    # Update config with kwargs
+    if 'attn_implementation' in kwargs:
+        config._attn_implementation = kwargs['attn_implementation']
+    if 'moe_impl' in kwargs:
+        config.moe_impl = kwargs['moe_impl']
 
-    # Clear any existing GPU cache before loading
+    # Step 1: Create model on meta device (no memory allocation)
+    print("Creating model structure on meta device (no memory allocated)...")
+    with torch.device('meta'):
+        model = model_class(config)
+
+    # Step 2: Load weights directly from disk (streaming, no duplication)
+    print("Loading model weights from disk (streaming mode)...")
+    loaded_keys = load_weights_from_disk_to_meta(model, model_path, verbose=verbose)
+
+    # Step 3: Convert nn.Linear layers to RamTorch AFTER weights are loaded
+    print("Converting Linear layers to RamTorch (memory-efficient mode)...")
+    convert_to_ramtorch_post_load(model, device=device, verbose=verbose)
+
+    # Clear any GPU cache
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
     gc.collect()
-
-    # Load weights using streaming approach
-    print("Loading model weights (streaming mode to minimize memory)...")
-    loaded_keys = load_weights_streaming(model, model_path, verbose=verbose)
 
     # Check for missing parameters
     model_params = set(model.state_dict().keys())
