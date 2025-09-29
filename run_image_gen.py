@@ -108,7 +108,7 @@ def main(args):
     kwargs = dict(
         attn_implementation=args.attn_impl,
         torch_dtype="auto",
-        device_map=device_map_24gb,
+        device_map={'vae': 0, 'vision_model': 0, 'vision_aligner': 0, 'timestep_emb': 0, 'patch_embed': 0, 'time_embed': 0, 'final_layer': 0, 'time_embed_2': 0, 'model.wte': 0, 'model.layers.0': 0, 'model.layers.1': 'cpu', 'model.layers.2': 'cpu', 'model.layers.3': 'cpu', 'model.layers.4': 'cpu', 'model.layers.5': 'cpu', 'model.layers.6': 'cpu', 'model.layers.7': 'cpu', 'model.layers.8': 'cpu', 'model.layers.9': 'cpu', 'model.layers.10':'cpu', 'model.layers.11': 'cpu', 'model.layers.12': 'cpu', 'model.layers.13': 'cpu', 'model.layers.14': 'cpu', 'model.layers.15': 'cpu', 'model.layers.16': 'cpu', 'model.layers.17': 'cpu', 'model.layers.18': 'cpu', 'model.layers.19': 'cpu', 'model.layers.20': 'cpu', 'model.layers.21': 'cpu', 'model.layers.22': 'cpu', 'model.layers.23': 'cpu', 'model.layers.24': 'cpu', 'model.layers.25': 'cpu', 'model.layers.26': 'cpu', 'model.layers.27': 'cpu', 'model.layers.28': 'cpu', 'model.layers.29': 'cpu', 'model.layers.30': 'cpu', 'model.layers.31': 'cpu', 'model.ln_f': 0, 'lm_head': 0},
         moe_impl=args.moe_impl,
     )
     model = HunyuanImage3ForCausalMM.from_pretrained(args.model_id, **kwargs)
