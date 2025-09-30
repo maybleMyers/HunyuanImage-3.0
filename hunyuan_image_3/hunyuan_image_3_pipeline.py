@@ -28,6 +28,7 @@
 
 import inspect
 import math
+import gc
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List
 from typing import Optional, Tuple, Union
@@ -842,6 +843,10 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
                     if input_ids.shape[1] != model_kwargs["position_ids"].shape[1]:
                         input_ids = torch.gather(input_ids, 1, index=model_kwargs["position_ids"])
 
+                # Periodic memory cleanup during diffusion
+                if i % 10 == 0 and i > 0:
+                    torch.cuda.empty_cache()
+
                 if callback_on_step_end is not None:
                     callback_kwargs = {}
                     for k in callback_on_step_end_tensor_inputs:
@@ -854,6 +859,14 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
                 if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
                     progress_bar.update()
 
+        # Memory management before VAE decode
+        if hasattr(self.model, 'offload_manager') and self.model.offload_manager is not None:
+            self.model.offload_manager.prepare_for_vae_decode()
+        else:
+            # Manual cleanup if no offload manager
+            gc.collect()
+            torch.cuda.empty_cache()
+
         if hasattr(self.vae.config, 'scaling_factor') and self.vae.config.scaling_factor:
             latents = latents / self.vae.config.scaling_factor
         if hasattr(self.vae.config, 'shift_factor') and self.vae.config.shift_factor:
@@ -864,6 +877,14 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
 
         with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=True):
             image = self.vae.decode(latents, return_dict=False, generator=generator)[0]
+
+        # Cleanup after VAE decode
+        if hasattr(self.model, 'offload_manager') and self.model.offload_manager is not None:
+            self.model.offload_manager.cleanup_after_vae()
+        else:
+            # Manual cleanup if no offload manager
+            gc.collect()
+            torch.cuda.empty_cache()
 
         # b c t h w
         if hasattr(self.vae, "ffactor_temporal"):

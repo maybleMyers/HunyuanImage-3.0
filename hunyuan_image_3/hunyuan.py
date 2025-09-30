@@ -1664,22 +1664,42 @@ class HunyuanImage3Model(HunyuanImage3PreTrainedModel):
         all_self_attns = () if output_attentions else None
         next_decoder_cache = None
 
+        # Check if we have an offload manager
+        has_offload_manager = hasattr(self, 'offload_manager') and self.offload_manager is not None
+
         for layer_idx, decoder_layer in enumerate(self.layers):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
-            layer_outputs = decoder_layer(
-                hidden_states,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                past_key_value=past_key_values,
-                output_attentions=output_attentions,
-                use_cache=use_cache,
-                custom_pos_emb=custom_pos_emb,
-                mode=mode,
-                first_step=first_step,
-                gen_timestep_scatter_index=gen_timestep_scatter_index,
-            )
+            # Use offload manager if available
+            if has_offload_manager:
+                layer_outputs = self.offload_manager.execute_with_offload(
+                    layer_idx,
+                    decoder_layer,
+                    hidden_states,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    past_key_value=past_key_values,
+                    output_attentions=output_attentions,
+                    use_cache=use_cache,
+                    custom_pos_emb=custom_pos_emb,
+                    mode=mode,
+                    first_step=first_step,
+                    gen_timestep_scatter_index=gen_timestep_scatter_index,
+                )
+            else:
+                layer_outputs = decoder_layer(
+                    hidden_states,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    past_key_value=past_key_values,
+                    output_attentions=output_attentions,
+                    use_cache=use_cache,
+                    custom_pos_emb=custom_pos_emb,
+                    mode=mode,
+                    first_step=first_step,
+                    gen_timestep_scatter_index=gen_timestep_scatter_index,
+                )
 
             hidden_states = layer_outputs[0]
 
@@ -1763,6 +1783,22 @@ class HunyuanImage3ForCausalMM(HunyuanImage3PreTrainedModel, GenerationMixin):
 
         # Initialize weights and apply final processing
         self.post_init()
+
+        # Offload manager (will be set by run_image_gen.py if enabled)
+        self._offload_manager = None
+
+    @property
+    def offload_manager(self):
+        """Get the offload manager."""
+        return self._offload_manager
+
+    @offload_manager.setter
+    def offload_manager(self, manager):
+        """Set the offload manager and propagate to internal model."""
+        self._offload_manager = manager
+        # Propagate to the internal HunyuanImage3Model
+        if hasattr(self, 'model'):
+            self.model.offload_manager = manager
 
     @property
     def tokenizer(self):

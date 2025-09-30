@@ -14,7 +14,9 @@
 import argparse
 import os
 from pathlib import Path
+import torch
 from hunyuan_image_3.hunyuan import HunyuanImage3ForCausalMM
+from hunyuan_image_3.offload_manager import OffloadManager
 from PE.deepseek import DeepSeekClient
 from PE.system_prompt import system_prompt_universal, system_prompt_text_rendering
 
@@ -48,10 +50,26 @@ def parse_args():
     parser.add_argument("--save", type=str, default="image.png", help="Path to save the generated image")
     parser.add_argument("--verbose", type=int, default=0, help="Verbose level")
     parser.add_argument("--rewrite", default=False, help="Whether to rewrite the prompt with DeepSeek")
-    parser.add_argument("--sys-deepseek-prompt", type=str, choices=["universal", "text_rendering"], 
+    parser.add_argument("--sys-deepseek-prompt", type=str, choices=["universal", "text_rendering"],
                         default="universal", help="System prompt for rewriting the prompt")
 
     parser.add_argument("--reproduce", action="store_true", help="Whether to reproduce the results")
+
+    # Offloading configuration arguments
+    parser.add_argument("--offload-strategy", type=str, default="sequential",
+                        choices=["sequential", "memory_aware", "performance", "none"],
+                        help="Offloading strategy for model layers. 'none' disables offloading.")
+    parser.add_argument("--memory-threshold", type=float, default=0.85,
+                        help="VRAM usage threshold (0-1) before offloading layers")
+    parser.add_argument("--prefetch-distance", type=int, default=2,
+                        help="Number of layers to prefetch ahead")
+    parser.add_argument("--min-gpu-layers", type=int, default=2,
+                        help="Minimum number of layers to keep on GPU")
+    parser.add_argument("--max-gpu-layers", type=int, default=8,
+                        help="Maximum number of layers to keep on GPU")
+    parser.add_argument("--offload-verbose", action="store_true",
+                        help="Print offloading debug information")
+
     return parser.parse_args()
 
 
@@ -87,14 +105,58 @@ def main(args):
     if not Path(args.model_id).exists():
         raise ValueError(f"Model path {args.model_id} does not exist")
 
+    # Create offload manager for device map generation if not disabled
+    if args.offload_strategy != "none" and torch.cuda.is_available():
+        # Create a temporary offload manager to get optimal device map
+        temp_offload_mgr = OffloadManager(
+            model=None,  # We don't have the model yet
+            strategy=args.offload_strategy,
+            memory_threshold=args.memory_threshold,
+            prefetch_distance=args.prefetch_distance,
+            min_gpu_layers=args.min_gpu_layers,
+            max_gpu_layers=args.max_gpu_layers,
+            verbose=args.offload_verbose
+        )
+        device_map = temp_offload_mgr.get_optimal_device_map()
+
+        if args.offload_verbose:
+            print(f"Using dynamic device map with offload strategy: {args.offload_strategy}")
+            gpu_layers = sum(1 for k, v in device_map.items() if k.startswith('model.layers.') and v == 0)
+            print(f"Initial GPU layers: {gpu_layers}/32")
+    else:
+        # Use auto or CPU-only if offloading is disabled
+        device_map = "auto" if torch.cuda.is_available() else "cpu"
+        if args.verbose:
+            print(f"Offloading disabled, using device_map: {device_map}")
+
     kwargs = dict(
         attn_implementation=args.attn_impl,
         torch_dtype="auto",
-        device_map={'vae': 0, 'vision_model': 0, 'vision_aligner': 0, 'timestep_emb': 0, 'patch_embed': 0, 'time_embed': 0, 'final_layer': 0, 'time_embed_2': 0, 'model.wte': 0, 'model.layers.0': 'cpu', 'model.layers.1': 'cpu', 'model.layers.2': 'cpu', 'model.layers.3': 'cpu', 'model.layers.4': 'cpu', 'model.layers.5': 'cpu', 'model.layers.6': 'cpu', 'model.layers.7': 'cpu', 'model.layers.8': 'cpu', 'model.layers.9': 'cpu', 'model.layers.10':'cpu', 'model.layers.11': 'cpu', 'model.layers.12': 'cpu', 'model.layers.13': 'cpu', 'model.layers.14': 'cpu', 'model.layers.15': 'cpu', 'model.layers.16': 'cpu', 'model.layers.17': 'cpu', 'model.layers.18': 'cpu', 'model.layers.19': 'cpu', 'model.layers.20': 'cpu', 'model.layers.21': 'cpu', 'model.layers.22': 'cpu', 'model.layers.23': 'cpu', 'model.layers.24': 'cpu', 'model.layers.25': 'cpu', 'model.layers.26': 'cpu', 'model.layers.27': 'cpu', 'model.layers.28': 'cpu', 'model.layers.29': 'cpu', 'model.layers.30': 'cpu', 'model.layers.31': 'cpu', 'model.ln_f': 0, 'lm_head': 0},
+        device_map=device_map,
         moe_impl=args.moe_impl,
     )
+
+    # Set PYTORCH_CUDA_ALLOC_CONF for better memory management
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
     model = HunyuanImage3ForCausalMM.from_pretrained(args.model_id, **kwargs)
     model.load_tokenizer(args.model_id)
+
+    # Create offload manager after model is loaded
+    if args.offload_strategy != "none" and torch.cuda.is_available():
+        offload_manager = OffloadManager(
+            model=model,
+            strategy=args.offload_strategy,
+            memory_threshold=args.memory_threshold,
+            prefetch_distance=args.prefetch_distance,
+            min_gpu_layers=args.min_gpu_layers,
+            max_gpu_layers=args.max_gpu_layers,
+            verbose=args.offload_verbose
+        )
+        # Attach offload manager to model for use during generation
+        model.offload_manager = offload_manager
+    else:
+        model.offload_manager = None
 
     if args.rewrite:
         # 通过环境变量获取DeepSeek的key_id和key_secret
@@ -131,6 +193,10 @@ def main(args):
     Path(args.save).parent.mkdir(parents=True, exist_ok=True)
     image.save(args.save)
     print(f"Image saved to {args.save}")
+
+    # Print offload manager summary if used
+    if hasattr(model, 'offload_manager') and model.offload_manager:
+        model.offload_manager.print_summary()
 
 
 if __name__ == "__main__":
