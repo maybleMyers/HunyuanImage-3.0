@@ -107,21 +107,23 @@ class OffloadManager:
         """Move a component to a specific device."""
         comp = self._get_component(name)
         if comp is not None:
-            # Check if the component is on the meta device
+            # Check if the component is a meta-proxy for weights offloaded to disk
             try:
                 is_meta = next(comp.parameters()).is_meta
-            except StopIteration:  # handle modules with no parameters
+            except StopIteration:  # Handles modules with no parameters
                 is_meta = False
 
             if is_meta and hasattr(comp, "_hf_hook"):
-                # This module is a meta-proxy for offloaded weights.
-                # Instruct the accelerate hook to load weights directly onto the target device.
+                # This is an offloaded module. Delegate device placement to the accelerate hook.
+                # 1. Tell the hook which device to load the weights onto.
                 comp._hf_hook.execution_device = device
-                # Manually trigger the hook to materialize the module.
+                # 2. Trigger the hook. This will load weights from disk directly to the target device.
                 comp._hf_hook.pre_forward(comp)
-                # After this, `comp` is a fully materialized module on the target `device`.
+            else:
+                # This is a regular, materialized module (e.g., already on GPU or CPU).
+                # Move it using the standard PyTorch method.
+                comp = comp.to(device)
 
-            comp = comp.to(device)
             # Update the reference in the model
             parts = name.split('.')
             if len(parts) == 1:
