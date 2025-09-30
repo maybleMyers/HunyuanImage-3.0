@@ -108,10 +108,18 @@ class OffloadManager:
         comp = self._get_component(name)
         if comp is not None:
             # Check if the component is on the meta device
-            is_meta = any(p.is_meta for p in comp.parameters())
+            try:
+                is_meta = next(comp.parameters()).is_meta
+            except StopIteration:  # handle modules with no parameters
+                is_meta = False
+
             if is_meta and hasattr(comp, "_hf_hook"):
-                # Manually trigger the accelerate hook to materialize the module from disk
+                # This module is a meta-proxy for offloaded weights.
+                # Instruct the accelerate hook to load weights directly onto the target device.
+                comp._hf_hook.execution_device = device
+                # Manually trigger the hook to materialize the module.
                 comp._hf_hook.pre_forward(comp)
+                # After this, `comp` is a fully materialized module on the target `device`.
 
             comp = comp.to(device)
             # Update the reference in the model
