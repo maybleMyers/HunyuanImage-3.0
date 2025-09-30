@@ -107,6 +107,12 @@ class OffloadManager:
         """Move a component to a specific device."""
         comp = self._get_component(name)
         if comp is not None:
+            # Check if the component is on the meta device
+            is_meta = any(p.is_meta for p in comp.parameters())
+            if is_meta and hasattr(comp, "_hf_hook"):
+                # Manually trigger the accelerate hook to materialize the module from disk
+                comp._hf_hook.pre_forward(comp)
+
             comp = comp.to(device)
             # Update the reference in the model
             parts = name.split('.')
